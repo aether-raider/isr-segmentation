@@ -9,6 +9,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     tzdata \
     python3.10 \
     python3-pip \
+    python3-dev \
+    build-essential \
+    cmake \
     git \
     libopencv-dev \
     && rm -rf /var/lib/apt/lists/*
@@ -19,7 +22,7 @@ ENV DEBIAN_FRONTEND=dialog
 # Set Python alias
 RUN ln -s /usr/bin/python3.10 /usr/bin/python
 
-# Install Python dependency tooling before requirements
+# Install Python build tooling before dependencies
 COPY backend/requirements.txt .
 RUN pip install --no-cache-dir --upgrade pip setuptools wheel packaging
 RUN pip install --no-cache-dir -r requirements.txt
