@@ -257,6 +257,82 @@ npm run lint
 - **Model Size Options**: tiny, small, base_plus, large
 - **Recommended**: base_plus (good balance of speed/accuracy)
 - **Facebook Research**: https://github.com/facebookresearch/sam2
+ 
+## Model Weights & Download
+
+By default the backend uses HuggingFace's `from_pretrained()` API (see `backend/config.py`). That means:
+
+- Automatic download: If `MODEL_PATH` in `backend/.env` is a HuggingFace model ID (for example `OpenGVLab/Think2Seg-RS-7B`) the container or local process will download the weights automatically the first time the server starts (internet required).
+- Cache location: downloaded files are cached under the model cache directory configured in `backend/.env` (default: `.model_cache`). When running with Docker Compose the demo maps a named volume to `/app/.model_cache` so downloads persist across container restarts.
+
+When you may prefer to download weights manually (offline environments, faster startup, or to provide private tokens), follow one of the options below.
+
+1) Let Docker download automatically (recommended)
+
+ - Ensure the host has internet access.
+ - If the model is private, set your HuggingFace token in the environment so the container can access it:
+
+```bash
+# on the host (PowerShell)
+setx HUGGINGFACE_HUB_TOKEN "<your_token>"
+# or add to backend/.env: HUGGINGFACE_HUB_TOKEN=<your_token>
+```
+
+ - Start the stack:
+
+```bash
+docker-compose up --build
+```
+
+The backend will download the model into the cache directory and load it on startup.
+
+2) Pre-download the model on the host and mount it into the container
+
+ - Install `huggingface_hub` on your host (or use an environment that has it):
+
+```bash
+pip install huggingface_hub
+huggingface-cli login   # if model is private
+```
+
+ - Use `snapshot_download` to pull the model to a local folder (example):
+
+```bash
+python - <<PY
+from huggingface_hub import snapshot_download
+snapshot_download("OpenGVLab/Think2Seg-RS-7B", cache_dir="./model_cache/Think2Seg-RS-7B")
+PY
+```
+
+ - Update `backend/.env` to point `MODEL_PATH` at the downloaded folder (inside the container). If you plan to mount `./model_cache` into the container at `/app/.model_cache`, set:
+
+```ini
+MODEL_PATH=/app/.model_cache/Think2Seg-RS-7B
+```
+
+ - Update `docker-compose.yml` (backend service) to mount the folder (example snippet):
+
+```yaml
+services:
+  backend:
+    volumes:
+      - ./model_cache:/app/.model_cache
+```
+
+ - Then start the stack:
+
+```bash
+docker-compose up --build
+```
+
+3) Local development (no Docker)
+
+ - If running locally (not in Docker), download the model into `backend/.model_cache/Think2Seg-RS-7B` and set `MODEL_PATH=backend/.model_cache/Think2Seg-RS-7B` in your local `.env` before running `python main.py`.
+
+Notes
+- Disk usage: Think2Seg model weights can be large (several GB). Ensure you have ~30–50GB free for models and caches.
+- Private models: use `huggingface-cli login` or set `HUGGINGFACE_HUB_TOKEN` so the process/container can authenticate.
+- If downloads fail in Docker, check the container logs (`docker-compose logs backend`) to see the exact error.
 
 ## UI Features
 
