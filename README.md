@@ -59,7 +59,7 @@ A modern full-stack demo application showcasing capabilities for segmenting sate
 
 ```bash
 # 1. Navigate to the demo folder
-dcd c:\Users\lwj_n\Projects\ISR\Think2Seg-Demo
+cd <project-directory>
 
 # 2. Build and start both services
 docker-compose up --build
