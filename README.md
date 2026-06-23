@@ -16,7 +16,7 @@ A modern full-stack demo application showcasing capabilities for segmenting sate
 
 ```
 ┌─────────────────────────────────────────────────────────┐
-│                    FRONTEND (Vue 3/React)              │
+│                    FRONTEND (Vue 3/React)               │
 │  • Image Upload (Drag & Drop)                           │
 │  • Natural Language Input                               │
 │  • Results Visualization                                │
@@ -25,18 +25,18 @@ A modern full-stack demo application showcasing capabilities for segmenting sate
                            │ HTTP/REST
                            ▼
 ┌─────────────────────────────────────────────────────────┐
-│              BACKEND (FastAPI/Python)                  │
+│              BACKEND (FastAPI/Python)                   │
 │  • Image Preprocessing                                  │
-│  • Think2Seg-RS Inference                              │
-│  • SAM2 Segmentation                                   │
-│  • Result Post-processing                              │
+│  • Think2Seg-RS Inference                               │
+│  • SAM2 Segmentation                                    │
+│  • Result Post-processing                               │
 └──────────────────────────┬──────────────────────────────┘
                            │
                            ▼
 ┌─────────────────────────────────────────────────────────┐
-│          ML MODELS (CUDA/GPU)                          │
-│  • Qwen-2.5-VL (LVLM for reasoning)                    │
-│  • SAM2 (Segmentation Model)                           │
+│          ML MODELS (CUDA/GPU)                           │
+│  • Qwen-2.5-VL (LVLM for reasoning)                     │
+│  • SAM2 (Segmentation Model)                            │
 └─────────────────────────────────────────────────────────┘
 ```
 
