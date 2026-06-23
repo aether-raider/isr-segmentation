@@ -58,17 +58,42 @@ A modern full-stack demo application showcasing capabilities for segmenting sate
 ### Option 1: Docker Compose (Recommended)
 
 ```bash
-# 1. Clone/navigate to project
-cd <path_where_project_is_located>
+# 1. Navigate to the demo folder
+dcd c:\Users\lwj_n\Projects\ISR\Think2Seg-Demo
 
-# 2. Start services
+# 2. Build and start both services
 docker-compose up --build
 
-# 3. Access the application
+# 3. Open the app in your browser
 # Frontend: http://localhost:3000
 # Backend: http://localhost:8000
-# API Docs: http://localhost:8000/docs
+# API docs: http://localhost:8000/docs
 ```
+
+### Docker Compose commands
+
+```bash
+# Rebuild the backend and frontend images
+docker-compose build --no-cache
+
+# Start services in detached mode
+docker-compose up -d
+
+# View backend logs
+docker-compose logs -f backend
+
+# Stop and remove containers
+docker-compose down
+
+# Remove containers, networks, and volumes
+docker-compose down -v
+```
+
+### Notes
+
+- If you are using an NVIDIA GPU, make sure Docker is configured for GPU support.
+- The backend currently defaults to `DEVICE=cuda` in `backend/.env`.
+- For CPU-only setups, change `DEVICE=cpu` and use a compatible CPU PyTorch install.
 
 ### Option 2: Local Development
 
