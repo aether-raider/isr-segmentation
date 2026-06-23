@@ -32,7 +32,8 @@ RUN pip install --no-cache-dir --extra-index-url https://download.pytorch.org/wh
     "torch" "torchvision"
 
 # Install remaining dependencies
-RUN pip install --no-cache-dir -r requirements.txt
+# Disable PEP517 build isolation so build-time checks (e.g. flash-attn) can import preinstalled torch
+RUN PIP_NO_BUILD_ISOLATION=1 pip install --no-cache-dir -r requirements.txt
 
 # Copy backend code
 COPY backend/ .
