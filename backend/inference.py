@@ -35,19 +35,27 @@ class Think2SegInference:
         try:
             logger.info(f"Loading Think2Seg model: {settings.model_path}")
 
-            # Load tokenizer
-            self.tokenizer = AutoTokenizer.from_pretrained(
-                settings.model_path,
-                trust_remote_code=True,
-            )
-
-            # Load main model
+            tokenizer_kwargs = {
+                "trust_remote_code": True,
+                "cache_dir": settings.cache_dir,
+            }
             model_kwargs = {
                 "torch_dtype": self._get_dtype(),
                 "device_map": "auto" if self.device == "cuda" else None,
                 "trust_remote_code": True,
+                "cache_dir": settings.cache_dir,
             }
+            if settings.huggingface_token:
+                tokenizer_kwargs["use_auth_token"] = settings.huggingface_token
+                model_kwargs["use_auth_token"] = settings.huggingface_token
 
+            # Load tokenizer
+            self.tokenizer = AutoTokenizer.from_pretrained(
+                settings.model_path,
+                **tokenizer_kwargs,
+            )
+
+            # Load main model
             self.model = AutoModel.from_pretrained(
                 settings.model_path,
                 **model_kwargs,

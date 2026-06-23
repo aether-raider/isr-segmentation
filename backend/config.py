@@ -15,6 +15,7 @@ class Settings(BaseSettings):
     # Model Configuration
     model_name: str = "Think2Seg-RS-7B"  # or "Think2Seg-RS-3B"
     model_path: Optional[str] = None  # HuggingFace model ID or local path
+    huggingface_token: Optional[str] = None  # Optional Hugging Face access token for gated repos
     device: str = "cuda"  # or "cpu"
     dtype: str = "bfloat16"  # or "float32"
 
@@ -43,9 +44,9 @@ class Settings(BaseSettings):
         """Post-initialization validation."""
         if self.model_path is None:
             if "3B" in self.model_name:
-                self.model_path = "OpenGVLab/Think2Seg-RS-3B"
+                self.model_path = "RicardoString/Think2Seg-RS-3B"
             else:
-                self.model_path = "OpenGVLab/Think2Seg-RS-7B"
+                self.model_path = "RicardoString/Think2Seg-RS-7B"
 
 
 settings = Settings()
