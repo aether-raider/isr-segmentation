@@ -4,8 +4,8 @@ python-multipart==0.0.6
 pydantic==2.5.0
 pydantic-settings==2.1.0
 python-dotenv==1.0.0
-torch==2.6.0
-torchvision==0.17.0
+# torch and torchvision are installed separately in Dockerfile for CUDA compatibility
+# install "torch" and "torchvision" in the Dockerfile to ensure matching CUDA builds
 transformers==4.49.0
 pillow==10.1.0
 numpy==1.24.3
