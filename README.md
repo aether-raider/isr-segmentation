@@ -1,8 +1,8 @@
-# Think2Seg Demo - Natural Language Satellite Image Segmentation
+# ISR Segmentation - Natural Language Satellite Image Segmentation
 
-A modern full-stack demo application showcasing **Think2Seg-RS** capabilities for segmenting satellite imagery using natural language prompts.
+A modern full-stack demo application showcasing capabilities for segmenting satellite imagery using natural language prompts.
 
-## 🎯 Features
+## Features
 
 - **Natural Language Interface**: Describe what you want to segment in plain English
 - **Real-time Processing**: Fast satellite image segmentation powered by Think2Seg-RS
@@ -12,7 +12,7 @@ A modern full-stack demo application showcasing **Think2Seg-RS** capabilities fo
 - **GPU Accelerated**: CUDA support for faster inference
 - **Multi-Format Support**: Works with PNG, JPG, TIFF images
 
-## 🏗️ Architecture
+## Architecture
 
 ```
 ┌─────────────────────────────────────────────────────────┐
@@ -40,7 +40,7 @@ A modern full-stack demo application showcasing **Think2Seg-RS** capabilities fo
 └─────────────────────────────────────────────────────────┘
 ```
 
-## 📋 Prerequisites
+## Prerequisites
 
 ### For Local Development
 - **Python 3.10+**: Backend runtime
@@ -53,13 +53,13 @@ A modern full-stack demo application showcasing **Think2Seg-RS** capabilities fo
 - **RAM**: 16GB system RAM minimum
 - **Storage**: 50GB for models + workspace
 
-## 🚀 Quick Start
+## Quick Start
 
 ### Option 1: Docker Compose (Recommended)
 
 ```bash
 # 1. Clone/navigate to project
-cd c:\Users\lwj_n\Projects\ISR\Think2Seg-Demo
+cd <path_where_project_is_located>
 
 # 2. Start services
 docker-compose up --build
@@ -119,7 +119,7 @@ npm run dev
 
 Frontend will be available at `http://localhost:5173`
 
-## 📡 API Endpoints
+## API Endpoints
 
 ### Health & Status
 - `GET /health` - Health check
@@ -145,7 +145,7 @@ Frontend will be available at `http://localhost:5173`
 - Swagger UI: `http://localhost:8000/docs`
 - ReDoc: `http://localhost:8000/redoc`
 
-## ⚙️ Configuration
+## Configuration
 
 ### Environment Variables
 
@@ -177,7 +177,7 @@ USE_CACHE=true
 VITE_API_URL=http://localhost:8000
 ```
 
-## 🔧 Development
+## Development
 
 ### Backend Development
 
@@ -219,7 +219,7 @@ npm run preview
 npm run lint
 ```
 
-## 📊 Model Information
+## Model Information
 
 ### Think2Seg-RS
 - **Architecture**: Qwen-2.5-VL + SAM2
@@ -233,7 +233,7 @@ npm run lint
 - **Recommended**: base_plus (good balance of speed/accuracy)
 - **Facebook Research**: https://github.com/facebookresearch/sam2
 
-## 🎨 UI Features
+## UI Features
 
 ### Image Upload
 - Drag & drop support
@@ -260,7 +260,7 @@ npm run lint
 - "agricultural fields"
 - "industrial structures"
 
-## 🐳 Docker Deployment
+## Docker Deployment
 
 ### Build Images
 
@@ -303,7 +303,7 @@ nvidia-docker --version
 docker run --gpus all ...
 ```
 
-## 📈 Performance Optimization
+## Performance Optimization
 
 ### For Faster Inference
 1. Use smaller SAM2 model: `tiny` or `small`
@@ -316,7 +316,7 @@ docker run --gpus all ...
 - **System RAM**: ~16GB minimum
 - **Model Cache**: ~30GB on disk
 
-## 🐛 Troubleshooting
+## Troubleshooting
 
 ### Model Loading Issues
 ```
@@ -344,7 +344,7 @@ export API_PORT=8001
 server: { port: 5174 }
 ```
 
-## 📦 Project Structure
+## Project Structure
 
 ```
 Think2Seg-Demo/
@@ -369,17 +369,13 @@ Think2Seg-Demo/
 └── README.md                   # This file
 ```
 
-## 📝 License
-
-This demo is built on top of Think2Seg-RS research. Please refer to the original project for licensing information.
-
-## 🔗 References
+## References
 
 - **Think2Seg-RS Paper**: ISPRS Journal of Photogrammetry and Remote Sensing
 - **GitHub**: [Open-R1 Repository](https://github.com/OpenGVLab/Open-R1)
 - **Models**: [HuggingFace Hub](https://huggingface.co/OpenGVLab)
 
-## 🤝 Contributing
+## Contributing
 
 To improve this demo:
 1. Fork the repository
@@ -387,31 +383,13 @@ To improve this demo:
 3. Make your changes
 4. Submit a pull request
 
-## ⚠️ Important Notes
+## Important Notes
 
 1. **First Run**: Model download may take 5-10 minutes on first startup
 2. **VRAM Requirements**: 7B model requires ~12GB VRAM
 3. **Internet Connection**: Required for model download from HuggingFace
 4. **Production Deployment**: Consider using Kubernetes, add authentication, implement caching
 
-## 🎓 Educational Use
-
-This demo is designed for:
-- Understanding Think2Seg capabilities
-- Exploring satellite image segmentation
-- Testing natural language-based interfaces
-- Learning multi-modal AI applications
-
-## 📞 Support
-
-For issues or questions:
-1. Check the Troubleshooting section
-2. Review API documentation: `/docs`
-3. Check backend logs: `docker-compose logs backend`
-4. Check frontend console: Browser DevTools
-
 ---
 
-**Created for Think2Seg-RS Demo** | Built with ❤️ using FastAPI, Vue.js, and Tailwind CSS
-#   i s r - s e g m e n t a t i o n  
- 
+Built using FastAPI, Vue.js, and Tailwind CSS
