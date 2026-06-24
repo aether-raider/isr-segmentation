@@ -63,7 +63,7 @@ COPY backend/ .
 EXPOSE 8123
 
 # Health check
-HEALTHCHECK --interval=30s --timeout=10s --start-period=40s --retries=3 \
+HEALTHCHECK --interval=30s --start-period=40s --retries=3 \
     CMD python -c "import os, urllib.request; port=os.getenv('API_PORT', '8123'); urllib.request.urlopen(f'http://localhost:{port}/health')" || exit 1
 
 # Run server

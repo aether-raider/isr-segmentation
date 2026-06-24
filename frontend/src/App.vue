@@ -110,14 +110,14 @@
               <div class="flex items-center justify-between gap-3">
                 <div>
                   <h3 class="text-sm font-semibold text-slate-800">Segmentation Parameters</h3>
-                  <p class="text-xs text-slate-500">Adjust mask strictness, cleanup, and iterative refinement.</p>
+                  <p class="text-xs text-slate-500">Starts from Think2Seg defaults; adjust only when a run needs tuning.</p>
                 </div>
                 <button
                   type="button"
                   class="rounded-md border border-slate-300 bg-white px-3 py-1.5 text-xs font-semibold text-slate-600 transition hover:border-cyan-500 hover:text-cyan-700"
                   @click="resetSegmentationSettings"
                 >
-                  Reset
+                  Think2Seg Defaults
                 </button>
               </div>
 
@@ -321,6 +321,64 @@
           </button>
         </div>
 
+        <div class="panel overflow-hidden">
+          <button
+            type="button"
+            class="flex w-full items-center justify-between gap-3 px-5 py-4 text-left transition hover:bg-slate-50"
+            @click="historyPanelOpen = !historyPanelOpen"
+          >
+            <div>
+              <h2 class="text-lg font-semibold">Past Outputs</h2>
+              <p class="text-sm text-slate-500">{{ outputHistory.length }} saved runs</p>
+            </div>
+            <span class="shrink-0 rounded-md border border-slate-300 px-2 py-1 text-xs font-semibold text-slate-600">
+              {{ historyPanelOpen ? 'Collapse' : 'Expand' }}
+            </span>
+          </button>
+
+          <div v-if="historyPanelOpen" class="border-t border-slate-200">
+            <div class="flex items-center justify-between gap-3 px-5 py-3">
+              <p class="text-xs text-slate-500">Saved in the backend output folder.</p>
+              <button
+                type="button"
+                class="rounded-md border border-slate-300 bg-white px-3 py-1.5 text-xs font-semibold text-slate-600 transition hover:border-cyan-500 hover:text-cyan-700"
+                @click="loadOutputHistory"
+              >
+                {{ historyLoading ? 'Loading' : 'Refresh' }}
+              </button>
+            </div>
+            <div v-if="outputHistory.length" class="max-h-80 divide-y divide-slate-200 overflow-auto">
+              <button
+                v-for="output in outputHistory"
+                :key="output.id"
+                type="button"
+                class="flex w-full gap-3 p-4 text-left transition hover:bg-slate-50"
+                @click="openSavedOutput(output)"
+              >
+                <img
+                  v-if="output.segmented_image_url || output.visualization_url || output.original_image_url"
+                  :src="output.segmented_image_url || output.visualization_url || output.original_image_url"
+                  alt=""
+                  class="h-14 w-16 rounded-md border border-slate-200 bg-slate-950 object-contain"
+                />
+                <div v-else class="flex h-14 w-16 items-center justify-center rounded-md border border-slate-200 bg-slate-100 text-xs text-slate-500">
+                  Saved
+                </div>
+                <div class="min-w-0 flex-1">
+                  <p class="truncate text-sm font-semibold text-slate-800">{{ output.filename || output.id }}</p>
+                  <p class="mt-1 truncate text-xs text-slate-500">{{ output.prompt || 'No prompt' }}</p>
+                  <p class="mt-1 text-[11px] text-slate-400">
+                    {{ output.target_count || 0 }} targets · {{ output.pass_count || 0 }} passes
+                  </p>
+                </div>
+              </button>
+            </div>
+            <div v-else class="px-5 py-5 text-sm text-slate-500">
+              No saved outputs yet.
+            </div>
+          </div>
+        </div>
+
         <div v-if="currentJob" class="panel p-5">
           <div class="flex items-start justify-between gap-4">
             <div>
@@ -344,6 +402,20 @@
               Elapsed {{ formatDuration(currentJob.elapsedMs) }}
               <span v-if="queuePosition(currentJob)"> · {{ queuePosition(currentJob) }}</span>
             </p>
+          </div>
+          <div class="mt-4 grid gap-2">
+            <div
+              v-for="item in progressChecklist(currentJob)"
+              :key="item.id"
+              :class="[
+                'flex items-center gap-3 rounded-md border px-3 py-2 text-xs',
+                checklistItemClass(item)
+              ]"
+            >
+              <span :class="['h-2.5 w-2.5 rounded-full', checklistDotClass(item)]"></span>
+              <span class="font-semibold">{{ item.label }}</span>
+              <span class="ml-auto text-[11px] uppercase tracking-wide">{{ item.state }}</span>
+            </div>
           </div>
         </div>
 
@@ -379,6 +451,64 @@
               >
                 {{ view.label }}
               </button>
+            </div>
+
+            <div
+              v-if="selectedView === 'targets' && targetOutputs(selectedJob).length"
+              class="mb-4 rounded-lg border border-slate-200 bg-slate-50 p-3"
+            >
+              <div class="flex items-center justify-between gap-3">
+                <div>
+                  <p class="text-sm font-semibold text-slate-800">Individual Target Masks</p>
+                  <p class="text-xs text-slate-500">Select the masks that are relevant for the final review.</p>
+                </div>
+                <span class="rounded-md bg-white px-2 py-1 text-xs font-semibold text-slate-600">
+                  {{ selectedTargetCount(selectedJob) }} selected
+                </span>
+              </div>
+              <div class="mt-3 grid grid-cols-2 gap-3 sm:grid-cols-4">
+                <button
+                  v-for="(targetOutput, index) in targetOutputs(selectedJob)"
+                  :key="`target-${targetOutput.target_number || index}`"
+                  type="button"
+                  :class="[
+                    'overflow-hidden rounded-lg border bg-white text-left transition hover:border-cyan-600',
+                    selectedTargetIndex === index ? 'border-cyan-700 ring-2 ring-cyan-100' : 'border-slate-200'
+                  ]"
+                  @click="selectedTargetIndex = index"
+                >
+                  <img
+                    v-if="targetSegmentedImage(targetOutput)"
+                    :src="targetSegmentedImage(targetOutput)"
+                    alt=""
+                    class="h-20 w-full bg-slate-950 object-contain"
+                  />
+                  <div v-else class="flex h-20 items-center justify-center bg-slate-100 text-xs text-slate-500">
+                    No image
+                  </div>
+                  <div class="space-y-2 p-2">
+                    <div class="flex items-start justify-between gap-2">
+                      <div>
+                        <p class="text-xs font-semibold text-slate-800">
+                          Target {{ targetOutput.target_number || index + 1 }}
+                        </p>
+                        <p class="mt-0.5 text-[11px] text-slate-500">
+                          Pass {{ targetOutput.pass_number || 1 }}
+                          <span v-if="targetOutput.score !== null && targetOutput.score !== undefined">
+                            · {{ Number(targetOutput.score).toFixed(2) }}
+                          </span>
+                        </p>
+                      </div>
+                      <input
+                        type="checkbox"
+                        class="mt-0.5 h-4 w-4 rounded border-slate-300 text-cyan-700 focus:ring-cyan-600"
+                        :checked="targetSelected(selectedJob, targetOutput)"
+                        @click.stop="toggleTargetSelection(selectedJob, targetOutput)"
+                      />
+                    </div>
+                  </div>
+                </button>
+              </div>
             </div>
 
             <div
@@ -477,31 +607,54 @@
             <div class="mt-4 rounded-lg border border-slate-800 bg-slate-950 text-slate-100">
               <div class="flex items-center justify-between border-b border-slate-800 px-4 py-3">
                 <div>
-                  <p class="text-sm font-semibold">Resource Log</p>
-                  <p class="text-xs text-slate-400">RAM and GPU memory snapshots while the job runs</p>
+                  <p class="text-sm font-semibold">Resource Usage</p>
+                  <p class="text-xs text-slate-400">RAM and VRAM usage while the job runs</p>
                 </div>
                 <span class="rounded-full bg-slate-800 px-2 py-1 text-xs text-slate-300">
-                  {{ latestResourceLog(selectedJob).length }} latest
+                  {{ latestResourceLog(selectedJob).length }} samples
                   <span v-if="selectedJob.resourceLogTotal">
                     of {{ selectedJob.resourceLogTotal }}
                   </span>
                 </span>
               </div>
-              <div v-if="latestResourceLog(selectedJob).length" class="max-h-72 overflow-auto p-3 font-mono text-xs">
-                <div
-                  v-for="entry in latestResourceLog(selectedJob)"
-                  :key="`${entry.time}-${entry.stage}`"
-                  class="border-b border-slate-800 py-2 last:border-0"
-                >
-                  <div class="flex flex-wrap items-center gap-x-3 gap-y-1 text-slate-400">
-                    <span>{{ formatLogTime(entry.time) }}</span>
-                    <span class="text-cyan-300">{{ entry.stage }}</span>
+              <div v-if="resourceGraphLines(selectedJob).length" class="p-4">
+                <div class="rounded-lg border border-slate-800 bg-slate-900 p-3">
+                  <svg viewBox="0 0 100 100" preserveAspectRatio="none" class="h-44 w-full">
+                    <line
+                      v-for="tick in [25, 50, 75]"
+                      :key="`grid-${tick}`"
+                      x1="0"
+                      x2="100"
+                      :y1="tick"
+                      :y2="tick"
+                      stroke="rgba(148, 163, 184, 0.18)"
+                      stroke-width="0.6"
+                    />
+                    <polyline
+                      v-for="line in resourceGraphLines(selectedJob)"
+                      :key="line.id"
+                      :points="line.points"
+                      fill="none"
+                      :stroke="line.color"
+                      stroke-width="2"
+                      vector-effect="non-scaling-stroke"
+                    />
+                  </svg>
+                </div>
+                <div class="mt-3 grid gap-2 sm:grid-cols-2">
+                  <div
+                    v-for="line in resourceGraphLines(selectedJob)"
+                    :key="`legend-${line.id}`"
+                    class="flex items-center gap-2 rounded-md bg-slate-900 px-3 py-2 text-xs"
+                  >
+                    <span class="h-2.5 w-2.5 rounded-full" :style="{ backgroundColor: line.color }"></span>
+                    <span class="font-semibold text-slate-200">{{ line.label }}</span>
+                    <span class="ml-auto text-slate-400">{{ line.latestLabel }}</span>
                   </div>
-                  <p class="mt-1 text-slate-200">{{ formatResourceSnapshot(entry.snapshot) }}</p>
                 </div>
               </div>
               <div v-else class="px-4 py-5 text-sm text-slate-400">
-                Resource snapshots will appear once this job starts.
+                Resource graph will appear once this job starts.
               </div>
             </div>
 
@@ -627,12 +780,12 @@ import axios from 'axios'
 
 const MAX_FILE_SIZE = 25 * 1024 * 1024
 const POLL_INTERVAL_MS = 2000
-const POLL_TIMEOUT_MS = 60000
 const resultViews = [
   { id: 'before', label: 'Before' },
   { id: 'overlay', label: 'Mask Overlay' },
   { id: 'mask', label: 'Mask Only' },
   { id: 'segmented', label: 'Segmented Image' },
+  { id: 'targets', label: 'Target Masks' },
   { id: 'passes', label: 'Pass Outputs' }
 ]
 const defaultSegmentationSettings = {
@@ -664,6 +817,7 @@ export default {
     const selectedJobId = ref(null)
     const selectedView = ref('before')
     const selectedPassIndex = ref(0)
+    const selectedTargetIndex = ref(0)
     const currentJobId = ref(null)
     const isQueueRunning = ref(false)
     const isDragging = ref(false)
@@ -671,6 +825,9 @@ export default {
     const modelStatus = ref({ loaded: false, model: 'Think2Seg-RS-7B' })
     const configPanelOpen = ref(true)
     const queuePanelOpen = ref(true)
+    const historyPanelOpen = ref(false)
+    const outputHistory = ref([])
+    const historyLoading = ref(false)
     const segmentationSettings = ref({ ...defaultSegmentationSettings })
     let nextLocalId = 1
     let elapsedTimer = null
@@ -698,6 +855,7 @@ export default {
         overlay: 'Image with segmentation mask overlay',
         mask: 'Segmentation mask only',
         segmented: 'Segmented image cutout',
+        targets: 'Segmented image from the selected target mask',
         passes: 'Segmented image from the selected refinement pass'
       }
       return labels[selectedView.value] || 'Segmentation view'
@@ -735,7 +893,7 @@ export default {
 
     const checkModelStatus = async () => {
       try {
-        const response = await axios.get('/api/health', { timeout: 5000 })
+        const response = await axios.get('/api/health')
         modelStatus.value = {
           loaded: Boolean(response.data.model_loaded),
           model: response.data.model || 'Think2Seg-RS-7B'
@@ -746,6 +904,65 @@ export default {
           model: 'Backend unavailable'
         }
       }
+    }
+
+    const loadOutputHistory = async () => {
+      historyLoading.value = true
+      try {
+        const response = await axios.get('/api/outputs')
+        outputHistory.value = response.data.outputs || []
+      } catch (err) {
+        error.value = `Could not load saved outputs: ${getErrorMessage(err)}`
+      } finally {
+        historyLoading.value = false
+      }
+    }
+
+    const openSavedOutput = (output) => {
+      const existing = queue.value.find((job) => job.id === `saved-${output.id}`)
+      if (existing) {
+        selectedJobId.value = existing.id
+        selectedView.value = existing.result?.target_outputs?.length ? 'targets' : 'segmented'
+        return
+      }
+
+      const result = output.result || {}
+      const targetNumbers = (result.target_outputs || [])
+        .map((target, index) => target.target_number || index + 1)
+      const job = {
+        id: `saved-${output.id}`,
+        serverJobId: output.id,
+        file: null,
+        name: output.filename || output.id,
+        size: 0,
+        previewUrl: result.original_image_url || output.original_image_url || '',
+        previewAvailable: Boolean(result.original_image_url || output.original_image_url),
+        dimensions: Array.isArray(result.original_size) ? `${result.original_size[0]} x ${result.original_size[1]}px` : 'Saved output',
+        prompt: output.prompt || result.prompt || '',
+        cropId: '',
+        jobType: 'prompt',
+        status: 'succeeded',
+        progress: 100,
+        uploadProgress: 100,
+        stage: 'Loaded from history',
+        message: 'Saved segmentation output',
+        elapsedMs: 0,
+        startedAt: null,
+        completedAt: Date.now(),
+        resourceLog: [],
+        resourceLogTotal: 0,
+        resourceSnapshot: null,
+        settings: optionsToSegmentationSettings(result.options),
+        selectedTargetNumbers: targetNumbers,
+        result,
+        error: null,
+        isSavedOutput: true
+      }
+      queue.value.unshift(job)
+      selectedJobId.value = job.id
+      selectedTargetIndex.value = 0
+      selectedPassIndex.value = 0
+      selectedView.value = targetNumbers.length ? 'targets' : 'segmented'
     }
 
     const handleFileSelect = (event) => {
@@ -810,6 +1027,7 @@ export default {
         resourceLogTotal: 0,
         resourceSnapshot: null,
         settings: null,
+        selectedTargetNumbers: [],
         result: null,
         error: null
       }
@@ -947,7 +1165,6 @@ export default {
           try {
             response = await axios.post(endpoint, formData, {
               headers: { 'Content-Type': 'multipart/form-data' },
-              timeout: 0,
               onUploadProgress: (event) => {
                 if (!event.total) return
                 job.uploadProgress = Math.round((event.loaded / event.total) * 100)
@@ -992,9 +1209,7 @@ export default {
         const jobPath = job.jobType === 'aether' ? 'aether/jobs' : 'segment/jobs'
         let response = null
         try {
-          response = await axios.get(`/api/${jobPath}/${job.serverJobId}`, {
-            timeout: POLL_TIMEOUT_MS
-          })
+          response = await axios.get(`/api/${jobPath}/${job.serverJobId}`)
         } catch (err) {
           if (!isTransientPollError(err)) {
             throw err
@@ -1040,8 +1255,12 @@ export default {
       if (job.status === 'succeeded') {
         job.progress = 100
         job.completedAt = job.completedAt || Date.now()
+        if (!(job.selectedTargetNumbers || []).length && targetOutputs(job).length) {
+          job.selectedTargetNumbers = targetOutputs(job).map((target, index) => targetNumber(target, index))
+        }
+        loadOutputHistory()
         if (selectedJobId.value === job.id) {
-          selectedView.value = 'overlay'
+          selectedView.value = targetOutputs(job).length ? 'targets' : 'overlay'
         }
       }
     }
@@ -1067,6 +1286,7 @@ export default {
         resourceLog: [],
         resourceLogTotal: 0,
         resourceSnapshot: null,
+        selectedTargetNumbers: [],
         result: null,
         error: null,
         startedAt: null,
@@ -1091,6 +1311,7 @@ export default {
             resourceLog: [],
             resourceLogTotal: 0,
             resourceSnapshot: null,
+            selectedTargetNumbers: [],
             result: null,
             error: null,
             startedAt: null,
@@ -1143,11 +1364,60 @@ export default {
     const resultViewAvailable = (job, viewId) => {
       if (!job) return false
       if (viewId === 'before') return Boolean(job.previewAvailable)
-      if (viewId === 'overlay') return Boolean(job.result?.visualization_base64)
-      if (viewId === 'mask') return Boolean(job.result?.mask_base64)
-      if (viewId === 'segmented') return Boolean(job.result?.segmented_image_base64)
+      if (viewId === 'overlay') return Boolean(job.result?.visualization_base64 || job.result?.visualization_url)
+      if (viewId === 'mask') return Boolean(job.result?.mask_base64 || job.result?.mask_url)
+      if (viewId === 'segmented') return Boolean(job.result?.segmented_image_base64 || job.result?.segmented_image_url)
+      if (viewId === 'targets') return targetOutputs(job).length > 0
       if (viewId === 'passes') return passOutputs(job).length > 0
       return false
+    }
+
+    const imageSource = (base64Value, urlValue) => {
+      if (base64Value) return `data:image/png;base64,${base64Value}`
+      return urlValue || ''
+    }
+
+    const targetOutputs = (job) => {
+      return Array.isArray(job?.result?.target_outputs) ? job.result.target_outputs : []
+    }
+
+    const targetNumber = (targetOutput, index = 0) => {
+      return targetOutput?.target_number || index + 1
+    }
+
+    const selectedTargetOutput = (job) => {
+      const outputs = targetOutputs(job)
+      if (!outputs.length) return null
+      const clampedIndex = Math.min(Math.max(selectedTargetIndex.value, 0), outputs.length - 1)
+      if (clampedIndex !== selectedTargetIndex.value) {
+        selectedTargetIndex.value = clampedIndex
+      }
+      return outputs[clampedIndex]
+    }
+
+    const targetSegmentedImage = (targetOutput) => {
+      return imageSource(targetOutput?.segmented_image_base64, targetOutput?.segmented_image_url)
+    }
+
+    const targetSelected = (job, targetOutput) => {
+      const number = targetNumber(targetOutput)
+      return (job?.selectedTargetNumbers || []).includes(number)
+    }
+
+    const selectedTargetCount = (job) => {
+      return (job?.selectedTargetNumbers || []).length
+    }
+
+    const toggleTargetSelection = (job, targetOutput) => {
+      if (!job) return
+      const number = targetNumber(targetOutput)
+      const current = new Set(job.selectedTargetNumbers || [])
+      if (current.has(number)) {
+        current.delete(number)
+      } else {
+        current.add(number)
+      }
+      job.selectedTargetNumbers = Array.from(current).sort((a, b) => a - b)
     }
 
     const passOutputs = (job) => {
@@ -1165,8 +1435,7 @@ export default {
     }
 
     const passSegmentedImage = (passOutput) => {
-      if (!passOutput?.segmented_image_base64) return ''
-      return `data:image/png;base64,${passOutput.segmented_image_base64}`
+      return imageSource(passOutput?.segmented_image_base64, passOutput?.segmented_image_url)
     }
 
     const selectedViewImage = (job) => {
@@ -1174,14 +1443,19 @@ export default {
       if (selectedView.value === 'before' && job.previewAvailable) {
         return job.previewUrl
       }
-      if (selectedView.value === 'overlay' && job.result?.visualization_base64) {
-        return `data:image/png;base64,${job.result.visualization_base64}`
+      if (selectedView.value === 'overlay') {
+        return imageSource(job.result?.visualization_base64, job.result?.visualization_url)
       }
-      if (selectedView.value === 'mask' && job.result?.mask_base64) {
-        return `data:image/png;base64,${job.result.mask_base64}`
+      if (selectedView.value === 'mask') {
+        return imageSource(job.result?.mask_base64, job.result?.mask_url)
       }
-      if (selectedView.value === 'segmented' && job.result?.segmented_image_base64) {
-        return `data:image/png;base64,${job.result.segmented_image_base64}`
+      if (selectedView.value === 'segmented') {
+        return imageSource(job.result?.segmented_image_base64, job.result?.segmented_image_url)
+      }
+      if (selectedView.value === 'targets') {
+        const targetOutput = selectedTargetOutput(job)
+        const targetImage = targetSegmentedImage(targetOutput)
+        if (targetImage) return targetImage
       }
       if (selectedView.value === 'passes') {
         const passOutput = selectedPassOutput(job)
@@ -1232,6 +1506,8 @@ export default {
     }
 
     const targetCount = (job) => {
+      const targetOutputCount = job?.result?.target_outputs?.length
+      if (typeof targetOutputCount === 'number') return targetOutputCount
       const count = job?.result?.sam_prompts?.length
       if (typeof count === 'number') return count
       if (typeof job?.result?.segment_count === 'number') return job.result.segment_count
@@ -1241,6 +1517,118 @@ export default {
 
     const latestResourceLog = (job) => {
       return (job?.resourceLog || []).slice(-RESOURCE_LOG_DISPLAY_LIMIT)
+    }
+
+    const resourceGraphLines = (job) => {
+      const samples = latestResourceLog(job)
+        .map((entry) => entry.snapshot)
+        .filter(Boolean)
+      if (!samples.length) return []
+
+      const series = []
+      const ramValues = samples.map((snapshot) => {
+        const ram = snapshot.ram || {}
+        if (!ram.total || ram.used === null || ram.used === undefined) return null
+        return Math.max(0, Math.min(100, (ram.used / ram.total) * 100))
+      })
+      series.push({
+        id: 'ram',
+        label: 'RAM',
+        color: '#22d3ee',
+        values: ramValues,
+        latestLabel: formatResourcePercent(samples.at(-1)?.ram?.used, samples.at(-1)?.ram?.total)
+      })
+
+      const maxGpuCount = Math.max(0, ...samples.map((snapshot) => (snapshot.gpus || []).length))
+      const gpuColors = ['#a78bfa', '#34d399', '#fbbf24', '#fb7185']
+      for (let index = 0; index < maxGpuCount; index += 1) {
+        const values = samples.map((snapshot) => {
+          const gpu = (snapshot.gpus || [])[index]
+          if (!gpu?.total || gpu.used === null || gpu.used === undefined) return null
+          return Math.max(0, Math.min(100, (gpu.used / gpu.total) * 100))
+        })
+        const latestGpu = (samples.at(-1)?.gpus || [])[index]
+        series.push({
+          id: `gpu-${index}`,
+          label: `GPU ${index} VRAM`,
+          color: gpuColors[index % gpuColors.length],
+          values,
+          latestLabel: formatResourcePercent(latestGpu?.used, latestGpu?.total)
+        })
+      }
+
+      return series
+        .map((item) => ({
+          ...item,
+          points: graphPoints(item.values)
+        }))
+        .filter((item) => item.points)
+    }
+
+    const graphPoints = (values) => {
+      const valid = values
+        .map((value, index) => ({ value, index }))
+        .filter((item) => item.value !== null && item.value !== undefined)
+      if (!valid.length) return ''
+      const denominator = Math.max(values.length - 1, 1)
+      return valid
+        .map((item) => {
+          const x = values.length === 1 ? 100 : (item.index / denominator) * 100
+          const y = 100 - item.value
+          return `${x.toFixed(2)},${y.toFixed(2)}`
+        })
+        .join(' ')
+    }
+
+    const formatResourcePercent = (used, total) => {
+      if (!total || used === null || used === undefined) return 'No data'
+      return `${Math.round((used / total) * 100)}% · ${formatBytes(used)} / ${formatBytes(total)}`
+    }
+
+    const progressChecklist = (job) => {
+      if (!job) return []
+      const stage = String(job.stage || job.message || '').toLowerCase()
+      const progress = Number(job.progress || 0)
+      const failed = job.status === 'failed'
+      const definitions = [
+        { id: 'queued', label: 'Queued', threshold: 1, match: ['queued', 'waiting'] },
+        { id: 'upload', label: 'Upload image', threshold: 2, match: ['upload'] },
+        { id: 'validate', label: 'Validate image', threshold: 4, match: ['validating', 'reading uploaded'] },
+        { id: 'models', label: 'Load models', threshold: 45, match: ['loading', 'models ready', 'qwen', 'sam2'] },
+        { id: 'prepare', label: 'Prepare image', threshold: 50, match: ['preparing image'] },
+        { id: 'prompts', label: 'Generate prompts', threshold: 58, match: ['generating spatial prompts'] },
+        { id: 'parse', label: 'Parse target prompts', threshold: 64, match: ['parsing target prompts'] },
+        { id: 'sam', label: 'Run SAM masks', threshold: 82, match: ['running sam', 'predicting target masks', 'predicted mask'] },
+        { id: 'refine', label: 'Refine masks', threshold: 92, match: ['mask refined', 'combining masks'] },
+        { id: 'render', label: 'Render outputs', threshold: 99, match: ['rendering', 'encoding result'] },
+        { id: 'complete', label: 'Complete', threshold: 100, match: ['complete'] }
+      ]
+      const activeIndex = definitions.findIndex((item) => item.match.some((token) => stage.includes(token)))
+      return definitions.map((item, index) => {
+        let state = 'pending'
+        if (failed && index >= activeIndex && activeIndex >= 0) {
+          state = 'blocked'
+        } else if (job.status === 'succeeded' || progress >= item.threshold) {
+          state = 'done'
+        } else if (index === activeIndex) {
+          state = 'running'
+        }
+        return { ...item, state }
+      })
+    }
+
+    const checklistItemClass = (item) => {
+      if (item.state === 'done') return 'border-emerald-200 bg-emerald-50 text-emerald-900'
+      if (item.state === 'running') return 'border-cyan-200 bg-cyan-50 text-cyan-900'
+      if (item.state === 'blocked') return 'border-rose-200 bg-rose-50 text-rose-900'
+      return 'border-slate-200 bg-white text-slate-500'
+    }
+
+    const checklistDotClass = (item) => {
+      if (item.state === 'done') return 'bg-emerald-600'
+      if (item.state === 'running') return 'bg-cyan-600'
+      if (item.state === 'blocked') return 'bg-rose-600'
+      return 'bg-slate-300'
     }
 
     const formatDuration = (ms = 0) => {
@@ -1297,18 +1685,11 @@ export default {
       return [502, 503, 504].includes(Number(err.response?.status))
     }
 
-    const isTimeoutError = (err) => {
-      return err.code === 'ECONNABORTED' || String(err.message || '').toLowerCase().includes('timeout')
-    }
-
     const isTransientPollError = (err) => {
-      return isTimeoutError(err) || isTransientGatewayError(err)
+      return isTransientGatewayError(err)
     }
 
     const getTransientPollMessage = (err) => {
-      if (isTimeoutError(err)) {
-        return `Status polling exceeded ${Math.round(POLL_TIMEOUT_MS / 1000)}s; keeping the job alive and retrying.`
-      }
       return `Gateway returned ${err.response?.status}; keeping the job alive and retrying.`
     }
 
@@ -1317,14 +1698,12 @@ export default {
       if ([502, 503, 504].includes(status)) {
         return `Backend gateway error (${status}). The backend may still be starting or temporarily busy.`
       }
-      if (isTimeoutError(err)) {
-        return 'Backend response timed out while the job was running. The queue will keep polling on retry.'
-      }
       return err.response?.data?.detail || err.message || 'Segmentation failed'
     }
 
     onMounted(() => {
       checkModelStatus()
+      loadOutputHistory()
       elapsedTimer = window.setInterval(() => {
         const now = Date.now()
         queue.value.forEach((job) => {
@@ -1360,7 +1739,11 @@ export default {
       modelStatus,
       configPanelOpen,
       queuePanelOpen,
+      historyPanelOpen,
+      outputHistory,
+      historyLoading,
       segmentationSettings,
+      selectedTargetIndex,
       refinementModeDescription,
       suggestedPrompts,
       resultViews,
@@ -1373,6 +1756,8 @@ export default {
       handleFileSelect,
       handleDrop,
       startQueue,
+      loadOutputHistory,
+      openSavedOutput,
       resetSegmentationSettings,
       retryJob,
       retryFailed,
@@ -1380,6 +1765,11 @@ export default {
       clearFinished,
       downloadJob,
       resultViewAvailable,
+      targetOutputs,
+      targetSegmentedImage,
+      targetSelected,
+      selectedTargetCount,
+      toggleTargetSelection,
       passOutputs,
       passSegmentedImage,
       selectedViewImage,
@@ -1390,6 +1780,10 @@ export default {
       queuePosition,
       targetCount,
       latestResourceLog,
+      resourceGraphLines,
+      progressChecklist,
+      checklistItemClass,
+      checklistDotClass,
       formatDuration,
       formatBytes,
       formatLogTime,

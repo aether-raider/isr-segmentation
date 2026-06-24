@@ -357,6 +357,7 @@ class Think2SegInference:
             all_instances = []
             model_outputs = []
             pass_outputs = []
+            target_outputs = []
             refinement_image = processed_image
             total_passes = options["refinement_passes"] + 1
 
@@ -392,12 +393,38 @@ class Think2SegInference:
                         f"{len(instances)} target prompt(s)"
                     ),
                 )
-                pass_mask = self._predict_sam_mask(
+                pass_mask, pass_targets = self._predict_sam_mask(
                     refinement_image,
                     instances,
                     progress_callback=progress_callback,
                     options=options,
                 )
+                pass_target_indices = []
+                if return_visualization:
+                    for pass_target in pass_targets:
+                        target_number = len(target_outputs) + 1
+                        target_mask = self._postprocess_mask(
+                            pass_target["mask"],
+                            options,
+                        )
+                        target_outputs.append({
+                            "target_number": target_number,
+                            "pass_number": pass_number,
+                            "target_in_pass": pass_target["target_in_pass"],
+                            "score": pass_target.get("score"),
+                            "sam_prompt": pass_target.get("sam_prompt"),
+                            "mask": target_mask.copy(),
+                            "visualization": self._create_visualization(
+                                processed_image,
+                                target_mask,
+                            ),
+                            "segmented_image": self._create_segmented_image(
+                                processed_image,
+                                target_mask,
+                            ),
+                        })
+                        pass_target_indices.append(target_number)
+
                 mask_np = self._combine_refinement_mask(
                     mask_np,
                     pass_mask,
@@ -411,6 +438,7 @@ class Think2SegInference:
                         "prompt_count": len(instances),
                         "model_output": model_output,
                         "sam_prompts": instances,
+                        "target_numbers": pass_target_indices,
                         "mask": mask_np.copy(),
                         "visualization": self._create_visualization(
                             processed_image,
@@ -447,6 +475,7 @@ class Think2SegInference:
             if return_visualization:
                 self._emit_progress(progress_callback, 94, "Rendering visualization")
                 results["pass_outputs"] = pass_outputs
+                results["target_outputs"] = target_outputs
                 results["visualization"] = self._create_visualization(
                     processed_image,
                     mask_np,
@@ -677,7 +706,7 @@ class Think2SegInference:
         instances: list[dict],
         progress_callback: Optional[ProgressCallback] = None,
         options: Optional[dict] = None,
-    ) -> np.ndarray:
+    ) -> tuple[np.ndarray, list[dict]]:
         """Run SAM2 with Qwen-generated boxes/points and combine instance masks."""
         options = self._normalize_options(options)
         image_array = np.array(image.convert("RGB"))
@@ -685,12 +714,13 @@ class Think2SegInference:
 
         if not instances:
             self._emit_progress(progress_callback, 90, "No targets found")
-            return np.zeros((height, width), dtype=np.uint8)
+            return np.zeros((height, width), dtype=np.uint8), []
 
         self._emit_progress(progress_callback, 66, "Computing SAM2 image embeddings")
         self.sam2_predictor.set_image(image_array)
         self._emit_progress(progress_callback, 78, "Predicting target masks")
         combined_mask = None
+        target_masks = []
 
         with torch.inference_mode():
             total_instances = len(instances)
@@ -724,6 +754,18 @@ class Think2SegInference:
                     instance_mask = raw_mask
                 else:
                     instance_mask = raw_mask > options["sam_mask_threshold"]
+                score = None
+                if scores is not None and len(scores) > best_mask_index:
+                    try:
+                        score = float(np.asarray(scores)[best_mask_index])
+                    except (TypeError, ValueError):
+                        score = None
+                target_masks.append({
+                    "target_in_pass": index + 1,
+                    "score": score,
+                    "sam_prompt": instance,
+                    "mask": instance_mask.astype(np.uint8),
+                })
                 combined_mask = (
                     instance_mask
                     if combined_mask is None
@@ -738,7 +780,7 @@ class Think2SegInference:
         if combined_mask is None:
             raise RuntimeError("SAM2 did not produce a mask for the generated prompts")
         self._emit_progress(progress_callback, 92, "Combining masks")
-        return self._postprocess_mask(combined_mask.astype(np.uint8), options)
+        return self._postprocess_mask(combined_mask.astype(np.uint8), options), target_masks
 
     def _normalize_box(self, box, width: int, height: int):
         if box is None:

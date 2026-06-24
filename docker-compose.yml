@@ -52,7 +52,6 @@ services:
     healthcheck:
       test: ["CMD", "python", "-c", "import os, urllib.request; port=os.getenv('API_PORT', '8123'); urllib.request.urlopen(f'http://localhost:{port}/health')"]
       interval: 30s
-      timeout: 10s
       retries: 3
       start_period: 40s
 

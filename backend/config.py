@@ -42,11 +42,12 @@ class Settings(BaseSettings):
 
     # Inference Settings
     max_image_size: int = 1024  # Maximum image dimension
-    inference_timeout: int = 300  # seconds
+    inference_timeout: Optional[int] = None
     batch_size: int = 1
     max_new_tokens: int = 1024
     clear_cuda_cache_after_run: bool = True
     enable_tf32: bool = True
+    output_dir: str = "outputs"
     aether_min_component_area: int = 50
     aether_dedup_iou_threshold: float = 0.55
     aether_dedup_containment_threshold: float = 0.85
@@ -55,7 +56,7 @@ class Settings(BaseSettings):
     # Ultra-Sim callback handoff
     ultra_sim_callback_base_url: Optional[str] = None
     ultra_sim_callback_token: Optional[str] = None
-    ultra_sim_callback_timeout: int = 60
+    ultra_sim_callback_timeout: Optional[int] = None
 
     # Model Caching
     use_cache: bool = True

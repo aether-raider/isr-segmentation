@@ -11,6 +11,7 @@ import threading
 import time
 import uuid
 from contextlib import asynccontextmanager
+from pathlib import Path
 from typing import Any
 from urllib.parse import quote, urlparse
 from urllib.request import Request, urlopen
@@ -18,7 +19,7 @@ from urllib.request import Request, urlopen
 import numpy as np
 from fastapi import BackgroundTasks, FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
+from fastapi.responses import FileResponse, JSONResponse
 from PIL import Image
 from pydantic import BaseModel
 
@@ -41,7 +42,7 @@ AETHER_JOBS_LOCK = threading.Lock()
 SEGMENTATION_RUN_LOCK = threading.Lock()
 MAX_JOB_HISTORY = 100
 MAX_RESOURCE_LOG_ENTRIES = 240
-MAX_RESOURCE_LOG_RESPONSE_ENTRIES = 12
+MAX_RESOURCE_LOG_RESPONSE_ENTRIES = 120
 TERMINAL_STATUSES = {"succeeded", "failed"}
 
 
@@ -333,6 +334,137 @@ def _mask_to_png_base64(mask: np.ndarray) -> str:
     return _encode_png_base64(Image.fromarray(mask_uint8))
 
 
+def _output_root() -> Path:
+    root = Path(settings.output_dir).expanduser()
+    if not root.is_absolute():
+        root = Path(__file__).resolve().parent / root
+    root.mkdir(parents=True, exist_ok=True)
+    return root
+
+
+def _safe_output_dir(output_id: str) -> Path:
+    root = _output_root().resolve()
+    output_dir = (root / output_id).resolve()
+    if root not in output_dir.parents and output_dir != root:
+        raise HTTPException(status_code=400, detail="Invalid output id")
+    return output_dir
+
+
+def _output_file_url(output_id: str, filename: str) -> str:
+    return f"/api/outputs/{quote(output_id, safe='')}/files/{quote(filename, safe='')}"
+
+
+def _save_image_file(output_dir: Path, filename: str, image: Image.Image) -> str:
+    image.save(output_dir / filename, format="PNG")
+    return filename
+
+
+def _save_mask_file(output_dir: Path, filename: str, mask: np.ndarray) -> str:
+    mask_uint8 = ((mask > 0) * 255).astype(np.uint8)
+    Image.fromarray(mask_uint8).save(output_dir / filename, format="PNG")
+    return filename
+
+
+def _strip_base64(value: Any) -> Any:
+    if isinstance(value, dict):
+        return {
+            key: _strip_base64(item)
+            for key, item in value.items()
+            if not key.endswith("_base64")
+        }
+    if isinstance(value, list):
+        return [_strip_base64(item) for item in value]
+    return value
+
+
+def _save_segmentation_outputs(
+    output_id: str,
+    source_filename: str | None,
+    prompt: str,
+    source_image: Image.Image,
+    results: dict[str, Any],
+    response_data: dict[str, Any],
+) -> None:
+    output_dir = _output_root() / output_id
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    response_data["output_id"] = output_id
+    response_data["output_metadata_url"] = f"/api/outputs/{quote(output_id, safe='')}/metadata"
+
+    original_name = _save_image_file(output_dir, "original.png", source_image.convert("RGB"))
+    response_data["original_image_url"] = _output_file_url(output_id, original_name)
+
+    if "mask" in results:
+        filename = _save_mask_file(output_dir, "final_mask.png", results["mask"])
+        response_data["mask_url"] = _output_file_url(output_id, filename)
+    if "visualization" in results:
+        filename = _save_image_file(output_dir, "final_overlay.png", results["visualization"])
+        response_data["visualization_url"] = _output_file_url(output_id, filename)
+    if "segmented_image" in results:
+        filename = _save_image_file(
+            output_dir,
+            "final_segmented.png",
+            results["segmented_image"],
+        )
+        response_data["segmented_image_url"] = _output_file_url(output_id, filename)
+
+    for index, (pass_result, pass_response) in enumerate(
+        zip(results.get("pass_outputs", []), response_data.get("pass_outputs", [])),
+        start=1,
+    ):
+        prefix = f"pass_{index:02d}"
+        if "mask" in pass_result:
+            filename = _save_mask_file(output_dir, f"{prefix}_mask.png", pass_result["mask"])
+            pass_response["mask_url"] = _output_file_url(output_id, filename)
+        if "visualization" in pass_result:
+            filename = _save_image_file(
+                output_dir,
+                f"{prefix}_overlay.png",
+                pass_result["visualization"],
+            )
+            pass_response["visualization_url"] = _output_file_url(output_id, filename)
+        if "segmented_image" in pass_result:
+            filename = _save_image_file(
+                output_dir,
+                f"{prefix}_segmented.png",
+                pass_result["segmented_image"],
+            )
+            pass_response["segmented_image_url"] = _output_file_url(output_id, filename)
+
+    for index, (target_result, target_response) in enumerate(
+        zip(results.get("target_outputs", []), response_data.get("target_outputs", [])),
+        start=1,
+    ):
+        prefix = f"target_{index:03d}"
+        if "mask" in target_result:
+            filename = _save_mask_file(output_dir, f"{prefix}_mask.png", target_result["mask"])
+            target_response["mask_url"] = _output_file_url(output_id, filename)
+        if "visualization" in target_result:
+            filename = _save_image_file(
+                output_dir,
+                f"{prefix}_overlay.png",
+                target_result["visualization"],
+            )
+            target_response["visualization_url"] = _output_file_url(output_id, filename)
+        if "segmented_image" in target_result:
+            filename = _save_image_file(
+                output_dir,
+                f"{prefix}_segmented.png",
+                target_result["segmented_image"],
+            )
+            target_response["segmented_image_url"] = _output_file_url(output_id, filename)
+
+    metadata = {
+        "id": output_id,
+        "filename": source_filename,
+        "prompt": prompt,
+        "created_at": _now(),
+        "result": _strip_base64(response_data),
+    }
+    with open(output_dir / "metadata.json", "w", encoding="utf-8") as metadata_file:
+        json.dump(metadata, metadata_file, indent=2)
+
+
 def _build_segment_response(results: dict[str, Any], prompt: str) -> dict[str, Any]:
     response_data = {
         "success": True,
@@ -383,6 +515,30 @@ def _build_segment_response(results: dict[str, Any], prompt: str) -> dict[str, A
     if pass_outputs:
         response_data["pass_outputs"] = pass_outputs
 
+    target_outputs = []
+    for target_output in results.get("target_outputs", []):
+        encoded_target = {
+            "target_number": target_output.get("target_number"),
+            "pass_number": target_output.get("pass_number"),
+            "target_in_pass": target_output.get("target_in_pass"),
+            "score": target_output.get("score"),
+            "sam_prompt": target_output.get("sam_prompt"),
+        }
+        if "mask" in target_output:
+            encoded_target["mask_base64"] = _mask_to_png_base64(target_output["mask"])
+        if "visualization" in target_output:
+            encoded_target["visualization_base64"] = _encode_png_base64(
+                target_output["visualization"],
+            )
+        if "segmented_image" in target_output:
+            encoded_target["segmented_image_base64"] = _encode_png_base64(
+                target_output["segmented_image"],
+            )
+        target_outputs.append(encoded_target)
+
+    if target_outputs:
+        response_data["target_outputs"] = target_outputs
+
     return response_data
 
 
@@ -391,6 +547,7 @@ def _run_segment_job(
     image_data: bytes,
     prompt: str,
     options: dict[str, Any],
+    filename: str | None = None,
 ) -> None:
     _update_job(
         job_id,
@@ -465,6 +622,14 @@ def _run_segment_job(
             )
             _append_resource_log(job_id, "Encoding result", "Encoding mask and visualization")
             response_data = _build_segment_response(results, prompt)
+            _save_segmentation_outputs(
+                job_id,
+                filename,
+                prompt,
+                image,
+                results,
+                response_data,
+            )
             _update_job(
                 job_id,
                 status="succeeded",
@@ -715,6 +880,55 @@ async def get_status():
     return get_inference_status()
 
 
+@app.get("/outputs")
+async def list_outputs():
+    """List saved segmentation output folders."""
+    outputs = []
+    for metadata_path in _output_root().glob("*/metadata.json"):
+        try:
+            with open(metadata_path, "r", encoding="utf-8") as metadata_file:
+                metadata = json.load(metadata_file)
+            result = metadata.get("result") or {}
+            outputs.append({
+                "id": metadata.get("id") or metadata_path.parent.name,
+                "filename": metadata.get("filename"),
+                "prompt": metadata.get("prompt"),
+                "created_at": metadata.get("created_at"),
+                "original_image_url": result.get("original_image_url"),
+                "visualization_url": result.get("visualization_url"),
+                "segmented_image_url": result.get("segmented_image_url"),
+                "target_count": len(result.get("target_outputs") or []),
+                "pass_count": len(result.get("pass_outputs") or []),
+                "result": result,
+            })
+        except Exception:
+            logger.warning("Could not read output metadata %s", metadata_path, exc_info=True)
+    outputs.sort(key=lambda item: item.get("created_at") or 0, reverse=True)
+    return {"outputs": outputs}
+
+
+@app.get("/outputs/{output_id}/metadata")
+async def get_output_metadata(output_id: str):
+    """Return metadata for one saved segmentation output."""
+    metadata_path = _safe_output_dir(output_id) / "metadata.json"
+    if not metadata_path.exists():
+        raise HTTPException(status_code=404, detail="Saved output not found")
+    with open(metadata_path, "r", encoding="utf-8") as metadata_file:
+        return json.load(metadata_file)
+
+
+@app.get("/outputs/{output_id}/files/{filename:path}")
+async def get_output_file(output_id: str, filename: str):
+    """Serve a saved output image from a segmentation run."""
+    output_dir = _safe_output_dir(output_id).resolve()
+    file_path = (output_dir / filename).resolve()
+    if output_dir not in file_path.parents and file_path != output_dir:
+        raise HTTPException(status_code=400, detail="Invalid output path")
+    if not file_path.exists() or not file_path.is_file():
+        raise HTTPException(status_code=404, detail="Output file not found")
+    return FileResponse(file_path)
+
+
 @app.post("/segment")
 async def segment_image(
     file: UploadFile = File(...),
@@ -780,7 +994,16 @@ async def segment_image(
         if not results["success"]:
             raise HTTPException(status_code=500, detail=results.get("error"))
 
-        return JSONResponse(_build_segment_response(results, prompt))
+        response_data = _build_segment_response(results, prompt)
+        _save_segmentation_outputs(
+            uuid.uuid4().hex,
+            file.filename,
+            prompt,
+            image,
+            results,
+            response_data,
+        )
+        return JSONResponse(response_data)
 
     except HTTPException:
         raise
@@ -845,7 +1068,14 @@ async def create_segment_job(
         SEGMENTATION_JOBS[job_id] = job
     _prune_jobs()
 
-    background_tasks.add_task(_run_segment_job, job_id, image_data, clean_prompt, options)
+    background_tasks.add_task(
+        _run_segment_job,
+        job_id,
+        image_data,
+        clean_prompt,
+        options,
+        file.filename,
+    )
     return JSONResponse(_serialize_job(job))
 
 
