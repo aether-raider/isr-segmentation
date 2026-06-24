@@ -29,6 +29,7 @@ from pydantic import BaseModel
 from config import settings
 from handoff import CLASS_PROMPTS, SemanticMask, build_handoff_bundle
 from inference import (
+    DEFAULT_PROMPT_PROVIDER_CONFIG,
     DEFAULT_SEGMENTATION_OPTIONS,
     get_inference_engine,
     get_inference_status,
@@ -69,6 +70,13 @@ class RuntimeSettingsRequest(BaseModel):
     model_max_memory_gb: float | None = None
 
 
+class PromptProviderSettingsRequest(BaseModel):
+    prompt_provider: str | None = None
+    litellm_model: str | None = None
+    litellm_api_key: str | None = None
+    litellm_api_base: str | None = None
+
+
 class PostprocessRequest(BaseModel):
     options: dict[str, Any] | None = None
     selected_target_numbers: list[int] | None = None
@@ -78,6 +86,7 @@ class PostprocessRequest(BaseModel):
 class RefineOutputRequest(BaseModel):
     prompts: list[str] | None = None
     options: dict[str, Any] | None = None
+    prompt_provider: dict[str, Any] | None = None
 
 
 def _now() -> float:
@@ -91,6 +100,7 @@ def _serialize_job(job: dict[str, Any]) -> dict[str, Any]:
         "filename": job.get("filename"),
         "prompt": job.get("prompt"),
         "prompts": job.get("prompts"),
+        "prompt_provider": job.get("prompt_provider"),
         "options": job.get("options"),
         "status": job["status"],
         "progress": job.get("progress", 0),
@@ -408,6 +418,71 @@ def _build_segmentation_options(
     return options
 
 
+def _normalize_prompt_provider_name(value: Any) -> str:
+    provider = str(value or "local").lower().strip()
+    if provider in {"byok", "litellm"}:
+        provider = "cloud"
+    if provider not in {"local", "cloud"}:
+        provider = "local"
+    return provider
+
+
+def _build_prompt_provider_config(
+    prompt_provider: str | None = None,
+    litellm_model: str | None = None,
+    litellm_api_key: str | None = None,
+    litellm_api_base: str | None = None,
+) -> dict[str, Any]:
+    config = {
+        "prompt_provider": _normalize_prompt_provider_name(
+            prompt_provider if prompt_provider is not None else settings.prompt_provider,
+        ),
+        "litellm_model": str(
+            litellm_model
+            if litellm_model is not None
+            else settings.litellm_model or ""
+        ).strip(),
+        "litellm_api_key": str(
+            litellm_api_key
+            if litellm_api_key is not None
+            else settings.litellm_api_key or ""
+        ).strip(),
+        "litellm_api_base": str(
+            litellm_api_base
+            if litellm_api_base is not None
+            else settings.litellm_api_base or ""
+        ).strip(),
+    }
+    if config["prompt_provider"] == "cloud" and not config["litellm_model"]:
+        raise HTTPException(
+            status_code=400,
+            detail="LiteLLM model is required when cloud prompt provider is selected",
+        )
+    return config
+
+
+def _sanitize_prompt_provider_config(config: dict[str, Any] | None) -> dict[str, Any]:
+    sanitized = dict(DEFAULT_PROMPT_PROVIDER_CONFIG)
+    if config:
+        sanitized.update({
+            "prompt_provider": _normalize_prompt_provider_name(config.get("prompt_provider")),
+            "litellm_model": config.get("litellm_model") or "",
+            "litellm_api_base": config.get("litellm_api_base") or "",
+            "has_litellm_api_key": bool(config.get("litellm_api_key")),
+        })
+    return sanitized
+
+
+def _prompt_provider_from_body(body: dict[str, Any] | None) -> dict[str, Any]:
+    body = body or {}
+    return _build_prompt_provider_config(
+        body.get("prompt_provider"),
+        body.get("litellm_model"),
+        body.get("litellm_api_key"),
+        body.get("litellm_api_base"),
+    )
+
+
 def _parse_prompt_layers(prompt: str, prompts_json: str | None = None) -> list[str]:
     prompts = []
     if prompts_json:
@@ -710,6 +785,7 @@ def _build_segment_response(results: dict[str, Any], prompt: str) -> dict[str, A
         "model_output": results.get("model_output"),
         "model_outputs": results.get("model_outputs"),
         "options": results.get("options"),
+        "prompt_provider": results.get("prompt_provider"),
         "refinement_passes_completed": results.get("refinement_passes_completed"),
     }
 
@@ -796,6 +872,7 @@ def _build_layered_results(
     image: Image.Image,
     prompts: list[str],
     options: dict[str, Any],
+    prompt_config: dict[str, Any] | None,
     progress_callback,
 ) -> dict[str, Any]:
     layer_results = []
@@ -819,6 +896,7 @@ def _build_layered_results(
             return_visualization=True,
             progress_callback=layer_progress,
             options=options,
+            prompt_config=prompt_config,
         )
         if not result.get("success"):
             raise RuntimeError(
@@ -869,6 +947,7 @@ def _build_layered_results(
         "model_output": "\n\n".join(model_outputs),
         "model_outputs": model_outputs,
         "options": options,
+        "prompt_provider": _sanitize_prompt_provider_config(prompt_config),
         "refinement_passes_completed": max(
             (layer.get("refinement_passes_completed") or 1 for layer in layer_results),
             default=1,
@@ -888,6 +967,7 @@ def _run_segment_job(
     filename: str | None = None,
     prompts: list[str] | None = None,
     metadata_extra: dict[str, Any] | None = None,
+    prompt_config: dict[str, Any] | None = None,
 ) -> None:
     _update_job(
         job_id,
@@ -944,12 +1024,14 @@ def _run_segment_job(
             progress_callback(45, "Models ready")
 
             layer_prompts = prompts or [prompt]
+            prompt_config = prompt_config or _build_prompt_provider_config()
             if len(layer_prompts) > 1:
                 results = _build_layered_results(
                     engine,
                     image,
                     layer_prompts,
                     options,
+                    prompt_config,
                     progress_callback=scaled_progress(45, 98),
                 )
             else:
@@ -959,6 +1041,7 @@ def _run_segment_job(
                     return_visualization=True,
                     progress_callback=scaled_progress(45, 98),
                     options=options,
+                    prompt_config=prompt_config,
                 )
             if not results["success"]:
                 raise RuntimeError(results.get("error") or "Segmentation failed")
@@ -988,6 +1071,7 @@ def _run_segment_job(
                 stage="Complete",
                 message="Segmentation complete",
                 result=response_data,
+                prompt_provider=_sanitize_prompt_provider_config(prompt_config),
                 completed_at=_now(),
             )
             logger.info("Segmentation job %s completed", job_id)
@@ -1243,6 +1327,38 @@ async def get_runtime_settings():
     }
 
 
+@app.get("/prompt-provider-settings")
+async def get_prompt_provider_settings():
+    """Return default prompt-generation provider settings without exposing keys."""
+    return {
+        "prompt_provider": _normalize_prompt_provider_name(settings.prompt_provider),
+        "litellm_model": settings.litellm_model or "",
+        "litellm_api_base": settings.litellm_api_base or "",
+        "has_litellm_api_key": bool(settings.litellm_api_key),
+    }
+
+
+@app.post("/prompt-provider-settings")
+async def update_prompt_provider_settings(request: PromptProviderSettingsRequest):
+    """Update prompt-generation provider defaults for future jobs."""
+    if request.prompt_provider is not None:
+        settings.prompt_provider = _normalize_prompt_provider_name(request.prompt_provider)
+    if request.litellm_model is not None:
+        settings.litellm_model = request.litellm_model.strip() or None
+    if request.litellm_api_base is not None:
+        settings.litellm_api_base = request.litellm_api_base.strip() or None
+    if request.litellm_api_key is not None:
+        settings.litellm_api_key = request.litellm_api_key.strip() or None
+
+    return {
+        "prompt_provider": _normalize_prompt_provider_name(settings.prompt_provider),
+        "litellm_model": settings.litellm_model or "",
+        "litellm_api_base": settings.litellm_api_base or "",
+        "has_litellm_api_key": bool(settings.litellm_api_key),
+        "message": "Prompt provider settings updated",
+    }
+
+
 @app.post("/runtime-settings")
 async def update_runtime_settings(request: RuntimeSettingsRequest):
     """Update resource allocation settings for future model loads."""
@@ -1430,6 +1546,7 @@ async def refine_output_job(
         0,
         base_options["refinement_mode"],
     )
+    prompt_config = _prompt_provider_from_body(request.prompt_provider)
     job_id = uuid.uuid4().hex
     image_data = image_path.read_bytes()
     clean_prompt = " | ".join(prompts)
@@ -1439,6 +1556,7 @@ async def refine_output_job(
         "filename": f"refine-{metadata.get('filename') or output_id}.png",
         "prompt": clean_prompt,
         "prompts": prompts,
+        "prompt_provider": _sanitize_prompt_provider_config(prompt_config),
         "options": options,
         "status": "queued",
         "progress": 0,
@@ -1470,6 +1588,7 @@ async def refine_output_job(
         job["filename"],
         prompts,
         metadata_extra,
+        prompt_config,
     )
     return JSONResponse(_serialize_job(job))
 
@@ -1479,6 +1598,10 @@ async def segment_image(
     file: UploadFile = File(...),
     prompt: str = Form(...),
     prompts_json: str | None = Form(None),
+    prompt_provider: str | None = Form(None),
+    litellm_model: str | None = Form(None),
+    litellm_api_key: str | None = Form(None),
+    litellm_api_base: str | None = Form(None),
     sam_mask_threshold: float = Form(DEFAULT_SEGMENTATION_OPTIONS["sam_mask_threshold"]),
     sam_multimask_output: bool = Form(DEFAULT_SEGMENTATION_OPTIONS["sam_multimask_output"]),
     mask_min_area: int = Form(DEFAULT_SEGMENTATION_OPTIONS["mask_min_area"]),
@@ -1531,6 +1654,12 @@ async def segment_image(
             refinement_passes,
             refinement_mode,
         )
+        prompt_config = _build_prompt_provider_config(
+            prompt_provider,
+            litellm_model,
+            litellm_api_key,
+            litellm_api_base,
+        )
 
         # Run segmentation
         if len(prompts) > 1:
@@ -1539,6 +1668,7 @@ async def segment_image(
                 image,
                 prompts,
                 options,
+                prompt_config,
                 progress_callback=lambda _progress, _message: None,
             )
         else:
@@ -1547,6 +1677,7 @@ async def segment_image(
                 prompts[0],
                 return_visualization=True,
                 options=options,
+                prompt_config=prompt_config,
             )
 
         if not results["success"]:
@@ -1577,6 +1708,10 @@ async def create_segment_job(
     file: UploadFile = File(...),
     prompt: str = Form(...),
     prompts_json: str | None = Form(None),
+    prompt_provider: str | None = Form(None),
+    litellm_model: str | None = Form(None),
+    litellm_api_key: str | None = Form(None),
+    litellm_api_base: str | None = Form(None),
     sam_mask_threshold: float = Form(DEFAULT_SEGMENTATION_OPTIONS["sam_mask_threshold"]),
     sam_multimask_output: bool = Form(DEFAULT_SEGMENTATION_OPTIONS["sam_multimask_output"]),
     mask_min_area: int = Form(DEFAULT_SEGMENTATION_OPTIONS["mask_min_area"]),
@@ -1608,12 +1743,19 @@ async def create_segment_job(
         refinement_passes,
         refinement_mode,
     )
+    prompt_config = _build_prompt_provider_config(
+        prompt_provider,
+        litellm_model,
+        litellm_api_key,
+        litellm_api_base,
+    )
     job_id = uuid.uuid4().hex
     job = {
         "id": job_id,
         "filename": file.filename,
         "prompt": clean_prompt,
         "prompts": prompts,
+        "prompt_provider": _sanitize_prompt_provider_config(prompt_config),
         "options": options,
         "status": "queued",
         "progress": 0,
@@ -1638,6 +1780,8 @@ async def create_segment_job(
         options,
         file.filename,
         prompts,
+        None,
+        prompt_config,
     )
     return JSONResponse(_serialize_job(job))
 

@@ -33,6 +33,10 @@ class Settings(BaseSettings):
     model_device_map: str = "auto"  # auto shards the VLM across visible GPUs
     model_gpu_memory_utilization: float = 0.95
     model_max_memory_gb: Optional[float] = None
+    prompt_provider: str = "local"
+    litellm_model: Optional[str] = None
+    litellm_api_key: Optional[str] = None
+    litellm_api_base: Optional[str] = None
     dtype: str = "bfloat16"  # or "float32"
 
     # SAM2 Configuration
@@ -76,6 +80,12 @@ class Settings(BaseSettings):
 
     def model_post_init(self, __context):
         """Post-initialization validation."""
+        self.prompt_provider = self.prompt_provider.lower().strip()
+        if self.prompt_provider in {"byok", "litellm"}:
+            self.prompt_provider = "cloud"
+        if self.prompt_provider not in {"local", "cloud"}:
+            self.prompt_provider = "local"
+
         if self.model_path is None:
             if "3B" in self.model_name:
                 self.model_path = "RicardoString/Think2Seg-RS-3B"

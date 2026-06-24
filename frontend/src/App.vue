@@ -109,6 +109,95 @@
               </button>
             </div>
 
+            <div v-if="runMode === 'prompt'" class="mt-5 rounded-lg border border-slate-200 bg-slate-50 p-3">
+              <div class="flex items-center justify-between gap-3">
+                <div>
+                  <h3 class="text-sm font-semibold text-slate-800">Prompt Provider</h3>
+                  <p class="text-xs leading-5 text-slate-500">Choose the local Think2Seg prompter or a BYOK cloud model through LiteLLM.</p>
+                </div>
+                <span class="rounded-md bg-white px-2 py-1 text-xs font-semibold text-slate-700">
+                  {{ promptProviderSettings.promptProvider === 'cloud' ? 'Cloud' : 'Local' }}
+                </span>
+              </div>
+              <div class="mt-3 grid grid-cols-2 gap-2 rounded-lg bg-white p-1">
+                <button
+                  type="button"
+                  :class="[
+                    'rounded-md px-3 py-2 text-xs font-semibold transition',
+                    promptProviderSettings.promptProvider === 'local' ? 'bg-cyan-700 text-white' : 'text-slate-600 hover:bg-slate-50'
+                  ]"
+                  @click="promptProviderSettings.promptProvider = 'local'"
+                >
+                  Local
+                </button>
+                <button
+                  type="button"
+                  :class="[
+                    'rounded-md px-3 py-2 text-xs font-semibold transition',
+                    promptProviderSettings.promptProvider === 'cloud' ? 'bg-cyan-700 text-white' : 'text-slate-600 hover:bg-slate-50'
+                  ]"
+                  @click="promptProviderSettings.promptProvider = 'cloud'"
+                >
+                  Cloud BYOK
+                </button>
+              </div>
+
+              <div v-if="promptProviderSettings.promptProvider === 'cloud'" class="mt-4 space-y-3">
+                <label class="block">
+                  <span class="text-xs font-semibold text-slate-700">Provider Preset</span>
+                  <select
+                    v-model="promptProviderSettings.providerPreset"
+                    class="mt-1 w-full rounded-lg border border-slate-300 bg-white p-2 text-sm focus:border-cyan-600 focus:outline-none focus:ring-2 focus:ring-cyan-100"
+                    @change="applyProviderPreset"
+                  >
+                    <option v-for="preset in cloudProviderPresets" :key="preset.id" :value="preset.id">
+                      {{ preset.label }}
+                    </option>
+                  </select>
+                </label>
+                <label class="block">
+                  <span class="text-xs font-semibold text-slate-700">LiteLLM Model ID</span>
+                  <input
+                    v-model="promptProviderSettings.litellmModel"
+                    type="text"
+                    placeholder="openai/gpt-4o, anthropic/claude-3-5-sonnet-latest..."
+                    class="mt-1 w-full rounded-lg border border-slate-300 bg-white p-2 text-sm focus:border-cyan-600 focus:outline-none focus:ring-2 focus:ring-cyan-100"
+                  />
+                </label>
+                <label class="block">
+                  <span class="text-xs font-semibold text-slate-700">API Key</span>
+                  <input
+                    v-model="promptProviderSettings.litellmApiKey"
+                    type="password"
+                    :placeholder="promptProviderSettings.hasBackendApiKey ? 'Using saved backend key unless replaced' : 'Paste provider API key'"
+                    autocomplete="off"
+                    class="mt-1 w-full rounded-lg border border-slate-300 bg-white p-2 text-sm focus:border-cyan-600 focus:outline-none focus:ring-2 focus:ring-cyan-100"
+                  />
+                </label>
+                <label class="block">
+                  <span class="text-xs font-semibold text-slate-700">Custom API Base</span>
+                  <input
+                    v-model="promptProviderSettings.litellmApiBase"
+                    type="text"
+                    placeholder="Optional OpenAI-compatible base URL"
+                    class="mt-1 w-full rounded-lg border border-slate-300 bg-white p-2 text-sm focus:border-cyan-600 focus:outline-none focus:ring-2 focus:ring-cyan-100"
+                  />
+                </label>
+              </div>
+              <div class="mt-3 flex items-center justify-between gap-3">
+                <p class="text-xs text-slate-500">
+                  {{ promptProviderSettings.message || 'Per-job settings are sent only when a segmentation starts.' }}
+                </p>
+                <button
+                  type="button"
+                  class="rounded-md border border-slate-300 bg-white px-3 py-1.5 text-xs font-semibold text-slate-600 transition hover:border-cyan-500 hover:text-cyan-700"
+                  @click="applyPromptProviderSettings"
+                >
+                  Apply
+                </button>
+              </div>
+            </div>
+
             <div v-if="runMode === 'prompt'" class="mt-5 border-t border-slate-200 pt-5">
               <div class="flex items-center justify-between gap-3">
                 <div>
@@ -905,6 +994,13 @@ const refinementModeDescriptions = {
   replace: 'Uses the newest pass only, which is useful for comparing whether iteration improves the mask.'
 }
 const RESOURCE_LOG_DISPLAY_LIMIT = 8
+const cloudProviderPresets = [
+  { id: 'openai', label: 'OpenAI', model: 'openai/gpt-4o' },
+  { id: 'anthropic', label: 'Anthropic', model: 'anthropic/claude-3-5-sonnet-latest' },
+  { id: 'google', label: 'Google Gemini', model: 'gemini/gemini-1.5-pro' },
+  { id: 'openai-compatible', label: 'OpenAI-compatible', model: 'openai/model-name' },
+  { id: 'custom', label: 'Custom LiteLLM ID', model: '' }
+]
 
 const wait = (ms) => new Promise((resolve) => setTimeout(resolve, ms))
 
@@ -932,6 +1028,15 @@ export default {
     const outputHistory = ref([])
     const historyLoading = ref(false)
     const segmentationSettings = ref({ ...defaultSegmentationSettings })
+    const promptProviderSettings = ref({
+      promptProvider: 'local',
+      providerPreset: 'openai',
+      litellmModel: 'openai/gpt-4o',
+      litellmApiKey: '',
+      litellmApiBase: '',
+      hasBackendApiKey: false,
+      message: ''
+    })
     const runtimeSettings = ref({
       modelGpuMemoryUtilization: 0.95,
       modelMaxMemoryGb: 0,
@@ -999,7 +1104,10 @@ export default {
       const inputReady = runMode.value === 'aether'
         ? Boolean(cropId.value.trim())
         : Boolean(prompt.value.trim())
-      return !isQueueRunning.value && runnableCount.value > 0 && inputReady
+      const providerReady = runMode.value !== 'prompt' ||
+        promptProviderSettings.value.promptProvider !== 'cloud' ||
+        Boolean(promptProviderSettings.value.litellmModel.trim())
+      return !isQueueRunning.value && runnableCount.value > 0 && inputReady && providerReady
     })
 
     const checkModelStatus = async () => {
@@ -1030,6 +1138,89 @@ export default {
         }
       } catch (err) {
         runtimeSettings.value.message = `Could not load runtime settings: ${getErrorMessage(err)}`
+      }
+    }
+
+    const loadPromptProviderSettings = async () => {
+      try {
+        const response = await axios.get('/api/prompt-provider-settings')
+        const data = response.data || {}
+        promptProviderSettings.value = {
+          ...promptProviderSettings.value,
+          promptProvider: data.prompt_provider || 'local',
+          litellmModel: data.litellm_model || promptProviderSettings.value.litellmModel,
+          litellmApiBase: data.litellm_api_base || '',
+          litellmApiKey: '',
+          hasBackendApiKey: Boolean(data.has_litellm_api_key),
+          message: data.has_litellm_api_key ? 'Backend BYOK key is configured.' : ''
+        }
+      } catch (err) {
+        promptProviderSettings.value.message = `Could not load provider settings: ${getErrorMessage(err)}`
+      }
+    }
+
+    const normalizePromptProviderSettings = (settings = {}) => {
+      const provider = settings.promptProvider === 'cloud' ? 'cloud' : 'local'
+      return {
+        promptProvider: provider,
+        providerPreset: settings.providerPreset || 'custom',
+        litellmModel: String(settings.litellmModel || '').trim(),
+        litellmApiKey: String(settings.litellmApiKey || '').trim(),
+        litellmApiBase: String(settings.litellmApiBase || '').trim(),
+        hasBackendApiKey: Boolean(settings.hasBackendApiKey),
+        message: settings.message || ''
+      }
+    }
+
+    const promptProviderPayload = (settings = promptProviderSettings.value) => {
+      const normalized = normalizePromptProviderSettings(settings)
+      const payload = {
+        prompt_provider: normalized.promptProvider,
+        litellm_model: normalized.litellmModel,
+        litellm_api_base: normalized.litellmApiBase
+      }
+      if (normalized.litellmApiKey) {
+        payload.litellm_api_key = normalized.litellmApiKey
+      }
+      return payload
+    }
+
+    const appendPromptProviderSettings = (formData, settings = promptProviderSettings.value) => {
+      const payload = promptProviderPayload(settings)
+      formData.append('prompt_provider', payload.prompt_provider)
+      if (payload.prompt_provider === 'cloud') {
+        formData.append('litellm_model', payload.litellm_model)
+        if (payload.litellm_api_key) {
+          formData.append('litellm_api_key', payload.litellm_api_key)
+        }
+        if (payload.litellm_api_base) {
+          formData.append('litellm_api_base', payload.litellm_api_base)
+        }
+      }
+    }
+
+    const applyProviderPreset = () => {
+      const preset = cloudProviderPresets.find((item) => item.id === promptProviderSettings.value.providerPreset)
+      if (preset?.model) {
+        promptProviderSettings.value.litellmModel = preset.model
+      }
+    }
+
+    const applyPromptProviderSettings = async () => {
+      try {
+        const payload = promptProviderPayload()
+        const response = await axios.post('/api/prompt-provider-settings', payload)
+        promptProviderSettings.value = {
+          ...promptProviderSettings.value,
+          promptProvider: response.data.prompt_provider || payload.prompt_provider,
+          litellmModel: response.data.litellm_model || payload.litellm_model,
+          litellmApiBase: response.data.litellm_api_base || payload.litellm_api_base,
+          litellmApiKey: '',
+          hasBackendApiKey: Boolean(response.data.has_litellm_api_key),
+          message: response.data.message || 'Prompt provider settings updated.'
+        }
+      } catch (err) {
+        promptProviderSettings.value.message = `Could not apply provider settings: ${getErrorMessage(err)}`
       }
     }
 
@@ -1094,6 +1285,7 @@ export default {
         resourceLogTotal: 0,
         resourceSnapshot: null,
         settings: optionsToSegmentationSettings(result.options),
+        promptProvider: result.prompt_provider || null,
         selectedTargetNumbers: targetNumbers,
         result,
         adjustedResult: null,
@@ -1186,6 +1378,7 @@ export default {
         resourceLogTotal: 0,
         resourceSnapshot: null,
         settings: null,
+        promptProvider: null,
         selectedTargetNumbers: [],
         adjustedResult: null,
         result: null,
@@ -1265,8 +1458,13 @@ export default {
       const queueCropId = cropId.value.trim()
       const queueMode = runMode.value
       const queueSettings = normalizeSegmentationSettings(segmentationSettings.value)
+      const queuePromptProvider = normalizePromptProviderSettings(promptProviderSettings.value)
       if (queueMode === 'prompt' && !queuePrompts.length) {
         error.value = 'Enter at least one layer prompt before starting the queue.'
+        return
+      }
+      if (queueMode === 'prompt' && queuePromptProvider.promptProvider === 'cloud' && !queuePromptProvider.litellmModel) {
+        error.value = 'Enter a LiteLLM model ID before starting a cloud prompt job.'
         return
       }
       if (queueMode === 'aether' && !queueCropId) {
@@ -1281,7 +1479,7 @@ export default {
         while (true) {
           const nextJob = queue.value.find((job) => job.status === 'queued' && !job.serverJobId)
           if (!nextJob) break
-          await processJob(nextJob, queuePrompt, queueMode, queueCropId, queueSettings, queuePrompts)
+          await processJob(nextJob, queuePrompt, queueMode, queueCropId, queueSettings, queuePrompts, queuePromptProvider)
         }
       } finally {
         isQueueRunning.value = false
@@ -1289,7 +1487,7 @@ export default {
       }
     }
 
-    const processJob = async (job, queuePrompt, queueMode, queueCropId, queueSettings, queuePrompts = []) => {
+    const processJob = async (job, queuePrompt, queueMode, queueCropId, queueSettings, queuePrompts = [], queuePromptProvider = null) => {
       currentJobId.value = job.id
       selectedJobId.value = job.id
       Object.assign(job, {
@@ -1298,6 +1496,7 @@ export default {
         cropId: queueMode === 'aether' ? queueCropId : '',
         jobType: queueMode,
         settings: queueMode === 'prompt' ? { ...queueSettings } : null,
+        promptProvider: queueMode === 'prompt' ? normalizePromptProviderSettings(queuePromptProvider || promptProviderSettings.value) : null,
         adjustedResult: null,
         status: 'uploading',
         progress: 1,
@@ -1323,6 +1522,7 @@ export default {
             formData.append('prompts_json', JSON.stringify(queuePrompts))
           }
           appendSegmentationSettings(formData, queueSettings)
+          appendPromptProviderSettings(formData, queuePromptProvider)
         }
 
         const endpoint = queueMode === 'aether' ? '/api/aether/jobs' : '/api/segment/jobs'
@@ -1410,6 +1610,7 @@ export default {
       job.result = serverJob.result || job.result
       job.error = serverJob.error || job.error
       job.prompts = serverJob.prompts || job.prompts || []
+      job.promptProvider = serverJob.prompt_provider || serverJob.result?.prompt_provider || job.promptProvider || null
       job.resourceLog = serverJob.resource_log || job.resourceLog || []
       job.resourceLogTotal = Number(serverJob.resource_log_total ?? job.resourceLog.length)
       job.resourceSnapshot = serverJob.resource_snapshot || job.resourceSnapshot || null
@@ -1445,6 +1646,15 @@ export default {
         }
         if (job.settings) {
           segmentationSettings.value = normalizeSegmentationSettings(job.settings)
+        }
+        if (job.promptProvider) {
+          promptProviderSettings.value = normalizePromptProviderSettings({
+            ...promptProviderSettings.value,
+            promptProvider: job.promptProvider.prompt_provider || job.promptProvider.promptProvider,
+            litellmModel: job.promptProvider.litellm_model || job.promptProvider.litellmModel,
+            litellmApiBase: job.promptProvider.litellm_api_base || job.promptProvider.litellmApiBase,
+            hasBackendApiKey: job.promptProvider.has_litellm_api_key || promptProviderSettings.value.hasBackendApiKey
+          })
         }
       }
       Object.assign(job, {
@@ -1569,7 +1779,8 @@ export default {
           : parseLayerPrompts(job.prompt || prompt.value)
         const response = await axios.post(`/api/outputs/${job.result.output_id}/refine/jobs`, {
           prompts,
-          options: segmentationSettingsToApiOptions(segmentationSettings.value)
+          options: segmentationSettingsToApiOptions(segmentationSettings.value),
+          prompt_provider: promptProviderPayload()
         })
         const refineJob = {
           id: `refine-${response.data.id}`,
@@ -1596,6 +1807,7 @@ export default {
           resourceLogTotal: Number(response.data.resource_log_total || 0),
           resourceSnapshot: response.data.resource_snapshot || null,
           settings: normalizeSegmentationSettings(segmentationSettings.value),
+          promptProvider: response.data.prompt_provider || normalizePromptProviderSettings(promptProviderSettings.value),
           selectedTargetNumbers: [],
           adjustedResult: null,
           result: null,
@@ -2019,6 +2231,7 @@ export default {
     onMounted(() => {
       checkModelStatus()
       loadRuntimeSettings()
+      loadPromptProviderSettings()
       loadOutputHistory()
       elapsedTimer = window.setInterval(() => {
         const now = Date.now()
@@ -2067,6 +2280,8 @@ export default {
       outputHistory,
       historyLoading,
       segmentationSettings,
+      promptProviderSettings,
+      cloudProviderPresets,
       runtimeSettings,
       selectedTargetIndex,
       refinementModeDescription,
@@ -2084,6 +2299,8 @@ export default {
       loadOutputHistory,
       openSavedOutput,
       appendPromptLayer,
+      applyProviderPreset,
+      applyPromptProviderSettings,
       applyRuntimeSettings,
       resetSegmentationSettings,
       retryJob,

@@ -1,6 +1,8 @@
 """Think2Seg inference wrapper for satellite-image segmentation."""
 
+import base64
 import gc
+import io
 import json
 import logging
 import re
@@ -46,6 +48,12 @@ DEFAULT_SEGMENTATION_OPTIONS = {
     "refinement_passes": 0,
     "refinement_mode": "intersection",
 }
+DEFAULT_PROMPT_PROVIDER_CONFIG = {
+    "prompt_provider": "local",
+    "litellm_model": "",
+    "litellm_api_base": "",
+    "has_litellm_api_key": False,
+}
 
 
 class Think2SegInference:
@@ -60,66 +68,20 @@ class Think2SegInference:
         self.sam2_predictor = None
         self.sam2_error = None
         self.loaded = False
+        self.local_prompter_loaded = False
         self._load_models(progress_callback=progress_callback)
 
     def _load_models(self, progress_callback: Optional[ProgressCallback] = None):
         """Load Think2Seg model and SAM2."""
         try:
-            logger.info(f"Loading Think2Seg model: {settings.model_path}")
-            self._emit_progress(progress_callback, 2, "Configuring CUDA runtime")
-
-            tokenizer_kwargs = {
-                "trust_remote_code": True,
-                "cache_dir": settings.cache_dir,
-            }
-            model_device_map = None
-            if self.device.startswith("cuda"):
-                model_device_map = settings.model_device_map or "auto"
-                if model_device_map.lower() in {"none", "false", "off"}:
-                    model_device_map = None
-            model_kwargs = {
-                "torch_dtype": self._get_dtype(),
-                "device_map": model_device_map,
-                "trust_remote_code": True,
-                "cache_dir": settings.cache_dir,
-            }
-            max_memory = self._get_model_max_memory(model_device_map)
-            if max_memory:
-                model_kwargs["max_memory"] = max_memory
-            if settings.hf_token:
-                tokenizer_kwargs["token"] = settings.hf_token
-                model_kwargs["token"] = settings.hf_token
-
+            logger.info("Loading Think2Seg segmentation runtime")
             self._configure_cuda_runtime()
 
-            # Load processor and VLM. Think2Seg-RS is a Qwen2.5-VL generation
-            # model that predicts structured SAM2 prompts, not masks directly.
-            self._emit_progress(progress_callback, 8, "Loading Qwen processor")
-            self.processor = AutoProcessor.from_pretrained(
-                settings.model_path,
-                **tokenizer_kwargs,
-            )
-
-            self._emit_progress(progress_callback, 14, "Loading Qwen vision-language model")
-            self.model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
-                settings.model_path,
-                **model_kwargs,
-            )
-
-            if getattr(self.model, "hf_device_map", None):
-                logger.info(
-                    "Think2Seg model dispatched with Accelerate device map; "
-                    "skipping manual .to(%s)",
-                    self.device,
-                )
+            if settings.prompt_provider == "local":
+                self._load_local_prompter(progress_callback=progress_callback)
             else:
-                self.model = self.model.to(self.device)
-
-            self.model.eval()
-            self.input_device = self._get_input_device()
-            self._emit_progress(progress_callback, 34, "Qwen model loaded")
-
-            logger.info("Think2Seg model loaded successfully")
+                logger.info("Using LiteLLM cloud prompt provider; local Qwen loads lazily")
+                self._emit_progress(progress_callback, 34, "Cloud prompt provider configured")
 
             self._emit_progress(progress_callback, 38, "Loading SAM2 model")
             self._load_sam2()
@@ -134,6 +96,65 @@ class Think2SegInference:
         except Exception as e:
             logger.error(f"Error loading models: {e}")
             raise
+
+    def _load_local_prompter(self, progress_callback: Optional[ProgressCallback] = None):
+        """Load the local Think2Seg/Qwen prompt generator."""
+        if self.local_prompter_loaded:
+            return
+
+        logger.info(f"Loading Think2Seg model: {settings.model_path}")
+        self._emit_progress(progress_callback, 2, "Configuring local Qwen runtime")
+
+        tokenizer_kwargs = {
+            "trust_remote_code": True,
+            "cache_dir": settings.cache_dir,
+        }
+        model_device_map = None
+        if self.device.startswith("cuda"):
+            model_device_map = settings.model_device_map or "auto"
+            if model_device_map.lower() in {"none", "false", "off"}:
+                model_device_map = None
+        model_kwargs = {
+            "torch_dtype": self._get_dtype(),
+            "device_map": model_device_map,
+            "trust_remote_code": True,
+            "cache_dir": settings.cache_dir,
+        }
+        max_memory = self._get_model_max_memory(model_device_map)
+        if max_memory:
+            model_kwargs["max_memory"] = max_memory
+        if settings.hf_token:
+            tokenizer_kwargs["token"] = settings.hf_token
+            model_kwargs["token"] = settings.hf_token
+
+        # Think2Seg-RS is a Qwen2.5-VL generation model that predicts
+        # structured SAM2 prompts, not masks directly.
+        self._emit_progress(progress_callback, 8, "Loading Qwen processor")
+        self.processor = AutoProcessor.from_pretrained(
+            settings.model_path,
+            **tokenizer_kwargs,
+        )
+
+        self._emit_progress(progress_callback, 14, "Loading Qwen vision-language model")
+        self.model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
+            settings.model_path,
+            **model_kwargs,
+        )
+
+        if getattr(self.model, "hf_device_map", None):
+            logger.info(
+                "Think2Seg model dispatched with Accelerate device map; "
+                "skipping manual .to(%s)",
+                self.device,
+            )
+        else:
+            self.model = self.model.to(self.device)
+
+        self.model.eval()
+        self.input_device = self._get_input_device()
+        self.local_prompter_loaded = True
+        self._emit_progress(progress_callback, 34, "Qwen model loaded")
+        logger.info("Think2Seg local prompter loaded successfully")
 
     def _get_dtype(self):
         """Get torch dtype from config."""
@@ -363,6 +384,7 @@ class Think2SegInference:
         return_visualization: bool = True,
         progress_callback: Optional[ProgressCallback] = None,
         options: Optional[dict] = None,
+        prompt_config: Optional[dict] = None,
     ) -> dict:
         """
         Segment satellite image based on natural language prompt.
@@ -380,10 +402,13 @@ class Think2SegInference:
 
         try:
             options = self._normalize_options(options)
+            prompt_config = self._normalize_prompt_provider_config(prompt_config)
             logger.info(f"Processing segmentation request: '{prompt}'")
             self._emit_progress(progress_callback, 5, "Checking model readiness")
             if self.sam2_predictor is None:
                 raise RuntimeError(f"SAM2 is not loaded: {self.sam2_error}")
+            if prompt_config["prompt_provider"] == "local":
+                self._load_local_prompter(progress_callback=progress_callback)
 
             self._emit_progress(progress_callback, 12, "Preparing image")
             processed_image = self.preprocess_image(image)
@@ -405,7 +430,11 @@ class Think2SegInference:
                     pass_start,
                     f"Pass {pass_number}/{total_passes}: generating spatial prompts",
                 )
-                model_output = self._generate_sam_prompt(refinement_image, prompt)
+                model_output = self._generate_sam_prompt(
+                    refinement_image,
+                    prompt,
+                    prompt_config=prompt_config,
+                )
                 model_outputs.append(model_output)
                 self._emit_progress(
                     progress_callback,
@@ -504,6 +533,7 @@ class Think2SegInference:
                 "model_outputs": model_outputs,
                 "sam_prompts": all_instances,
                 "options": options,
+                "prompt_provider": self._sanitize_prompt_provider_config(prompt_config),
                 "refinement_passes_completed": total_passes,
             }
 
@@ -563,8 +593,62 @@ class Think2SegInference:
             },
         ]
 
-    def _generate_sam_prompt(self, image: Image.Image, prompt: str) -> str:
+    def _normalize_prompt_provider_config(self, prompt_config: Optional[dict]) -> dict:
+        source = {
+            "prompt_provider": settings.prompt_provider,
+            "litellm_model": settings.litellm_model or "",
+            "litellm_api_key": settings.litellm_api_key or "",
+            "litellm_api_base": settings.litellm_api_base or "",
+        }
+        if prompt_config:
+            source.update({
+                key: value
+                for key, value in prompt_config.items()
+                if key in source and value is not None
+            })
+
+        provider = str(source.get("prompt_provider") or "local").lower().strip()
+        if provider in {"byok", "litellm"}:
+            provider = "cloud"
+        if provider not in {"local", "cloud"}:
+            provider = "local"
+        source["prompt_provider"] = provider
+        source["litellm_model"] = str(source.get("litellm_model") or "").strip()
+        source["litellm_api_key"] = str(source.get("litellm_api_key") or "").strip()
+        source["litellm_api_base"] = str(source.get("litellm_api_base") or "").strip()
+
+        if provider == "cloud" and not source["litellm_model"]:
+            raise RuntimeError("LiteLLM model is required when using the cloud prompt provider")
+        return source
+
+    @staticmethod
+    def _sanitize_prompt_provider_config(prompt_config: Optional[dict]) -> dict:
+        config = dict(DEFAULT_PROMPT_PROVIDER_CONFIG)
+        if prompt_config:
+            config.update({
+                "prompt_provider": prompt_config.get("prompt_provider") or "local",
+                "litellm_model": prompt_config.get("litellm_model") or "",
+                "litellm_api_base": prompt_config.get("litellm_api_base") or "",
+                "has_litellm_api_key": bool(prompt_config.get("litellm_api_key")),
+            })
+        return config
+
+    def _generate_sam_prompt(
+        self,
+        image: Image.Image,
+        prompt: str,
+        prompt_config: Optional[dict] = None,
+    ) -> str:
         """Generate structured SAM2 prompts from the Qwen2.5-VL prompter."""
+        prompt_config = self._normalize_prompt_provider_config(prompt_config)
+        if prompt_config["prompt_provider"] == "cloud":
+            return self._generate_sam_prompt_litellm(image, prompt, prompt_config)
+        return self._generate_sam_prompt_local(image, prompt)
+
+    def _generate_sam_prompt_local(self, image: Image.Image, prompt: str) -> str:
+        """Generate structured SAM2 prompts from the local Qwen2.5-VL prompter."""
+        if self.processor is None or self.model is None:
+            self._load_local_prompter()
         messages = self._build_messages(image, prompt)
 
         try:
@@ -611,6 +695,79 @@ class Think2SegInference:
             skip_special_tokens=True,
             clean_up_tokenization_spaces=False,
         )[0]
+
+    def _generate_sam_prompt_litellm(
+        self,
+        image: Image.Image,
+        prompt: str,
+        prompt_config: dict,
+    ) -> str:
+        """Generate structured SAM2 prompts through a user-provided LiteLLM model."""
+        try:
+            from litellm import completion
+        except ImportError as exc:
+            raise RuntimeError(
+                "LiteLLM is not installed. Install the backend dependencies again."
+            ) from exc
+
+        buffer = io.BytesIO()
+        image.save(buffer, format="PNG")
+        image_url = "data:image/png;base64," + base64.b64encode(
+            buffer.getvalue(),
+        ).decode("ascii")
+
+        messages = [
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": USER_PROMPT.format(Question=prompt)},
+                    {"type": "image_url", "image_url": {"url": image_url}},
+                ],
+            },
+        ]
+        kwargs = {
+            "model": prompt_config["litellm_model"],
+            "messages": messages,
+            "temperature": 0,
+            "max_tokens": settings.max_new_tokens,
+        }
+        if prompt_config.get("litellm_api_key"):
+            kwargs["api_key"] = prompt_config["litellm_api_key"]
+        if prompt_config.get("litellm_api_base"):
+            kwargs["api_base"] = prompt_config["litellm_api_base"]
+
+        response = completion(**kwargs)
+        return self._extract_litellm_content(response)
+
+    @staticmethod
+    def _extract_litellm_content(response) -> str:
+        try:
+            message = response.choices[0].message
+            content = getattr(message, "content", None)
+            if content is None and isinstance(message, dict):
+                content = message.get("content")
+        except Exception:
+            content = None
+
+        if content is None and isinstance(response, dict):
+            content = (
+                response.get("choices", [{}])[0]
+                .get("message", {})
+                .get("content")
+            )
+
+        if isinstance(content, list):
+            parts = []
+            for item in content:
+                if isinstance(item, dict):
+                    parts.append(str(item.get("text") or ""))
+                else:
+                    parts.append(str(getattr(item, "text", "") or item))
+            content = "".join(parts)
+        if not content:
+            raise RuntimeError("LiteLLM response did not include text content")
+        return str(content)
 
     def _move_inputs_to_device(self, inputs):
         if hasattr(inputs, "to"):
@@ -1035,6 +1192,13 @@ class Think2SegInference:
             "model_device_map": settings.model_device_map,
             "model_gpu_memory_utilization": settings.model_gpu_memory_utilization,
             "model_max_memory_gb": settings.model_max_memory_gb,
+            "prompt_provider": self._sanitize_prompt_provider_config({
+                "prompt_provider": settings.prompt_provider,
+                "litellm_model": settings.litellm_model,
+                "litellm_api_key": settings.litellm_api_key,
+                "litellm_api_base": settings.litellm_api_base,
+            }),
+            "local_prompter_loaded": self.local_prompter_loaded,
             "hf_device_map": hf_device_map,
             "sam2_device": settings.sam2_device,
             "clear_cuda_cache_after_run": settings.clear_cuda_cache_after_run,
@@ -1076,6 +1240,13 @@ def get_inference_status() -> dict:
         "model_device_map": settings.model_device_map,
         "model_gpu_memory_utilization": settings.model_gpu_memory_utilization,
         "model_max_memory_gb": settings.model_max_memory_gb,
+        "prompt_provider": Think2SegInference._sanitize_prompt_provider_config({
+            "prompt_provider": settings.prompt_provider,
+            "litellm_model": settings.litellm_model,
+            "litellm_api_key": settings.litellm_api_key,
+            "litellm_api_base": settings.litellm_api_base,
+        }),
+        "local_prompter_loaded": False,
         "hf_device_map": None,
         "sam2_device": settings.sam2_device,
         "clear_cuda_cache_after_run": settings.clear_cuda_cache_after_run,
