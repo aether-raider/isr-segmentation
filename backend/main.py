@@ -3,24 +3,46 @@ Think2Seg FastAPI Backend
 REST API for satellite image segmentation using natural language prompts.
 """
 
-import logging
-from contextlib import asynccontextmanager
-import io
 import base64
+import io
+import json
+import logging
+import threading
+import time
+import uuid
+from contextlib import asynccontextmanager
+from typing import Any
+from urllib.parse import quote, urlparse
+from urllib.request import Request, urlopen
 
-from fastapi import FastAPI, UploadFile, File, Form, HTTPException
+import numpy as np
+from fastapi import BackgroundTasks, FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel
 from PIL import Image
-import numpy as np
+from pydantic import BaseModel
 
 from config import settings
-from inference import get_inference_engine
+from handoff import CLASS_PROMPTS, SemanticMask, build_handoff_bundle
+from inference import (
+    DEFAULT_SEGMENTATION_OPTIONS,
+    get_inference_engine,
+    get_inference_status,
+)
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+SEGMENTATION_JOBS: dict[str, dict[str, Any]] = {}
+SEGMENTATION_JOBS_LOCK = threading.Lock()
+AETHER_JOBS: dict[str, dict[str, Any]] = {}
+AETHER_JOBS_LOCK = threading.Lock()
+SEGMENTATION_RUN_LOCK = threading.Lock()
+MAX_JOB_HISTORY = 100
+MAX_RESOURCE_LOG_ENTRIES = 240
+MAX_RESOURCE_LOG_RESPONSE_ENTRIES = 12
+TERMINAL_STATUSES = {"succeeded", "failed"}
 
 
 class SegmentationRequest(BaseModel):
@@ -37,21 +59,624 @@ class SegmentationResponse(BaseModel):
     error: str = None
 
 
+def _now() -> float:
+    return time.time()
+
+
+def _serialize_job(job: dict[str, Any]) -> dict[str, Any]:
+    resource_log = job.get("resource_log", [])
+    return {
+        "id": job["id"],
+        "filename": job.get("filename"),
+        "prompt": job.get("prompt"),
+        "options": job.get("options"),
+        "status": job["status"],
+        "progress": job.get("progress", 0),
+        "stage": job.get("stage", ""),
+        "message": job.get("message", ""),
+        "error": job.get("error"),
+        "result": job.get("result"),
+        "resource_snapshot": job.get("resource_snapshot"),
+        "resource_log": resource_log[-MAX_RESOURCE_LOG_RESPONSE_ENTRIES:],
+        "resource_log_total": len(resource_log),
+        "created_at": job.get("created_at"),
+        "started_at": job.get("started_at"),
+        "completed_at": job.get("completed_at"),
+        "updated_at": job.get("updated_at"),
+    }
+
+
+def _serialize_aether_job(job: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "id": job["id"],
+        "filename": job.get("filename"),
+        "crop_id": job.get("crop_id"),
+        "status": job["status"],
+        "progress": job.get("progress", 0),
+        "stage": job.get("stage", ""),
+        "message": job.get("message", ""),
+        "error": job.get("error"),
+        "result": job.get("result"),
+        "handoff": job.get("handoff"),
+        "created_at": job.get("created_at"),
+        "started_at": job.get("started_at"),
+        "completed_at": job.get("completed_at"),
+        "updated_at": job.get("updated_at"),
+    }
+
+
+def _get_job(job_id: str) -> dict[str, Any] | None:
+    with SEGMENTATION_JOBS_LOCK:
+        job = SEGMENTATION_JOBS.get(job_id)
+        return dict(job) if job else None
+
+
+def _update_job(job_id: str, **updates: Any) -> None:
+    with SEGMENTATION_JOBS_LOCK:
+        job = SEGMENTATION_JOBS.get(job_id)
+        if not job:
+            return
+        job.update(updates)
+        job["updated_at"] = _now()
+
+
+def _get_aether_job(job_id: str) -> dict[str, Any] | None:
+    with AETHER_JOBS_LOCK:
+        job = AETHER_JOBS.get(job_id)
+        return dict(job) if job else None
+
+
+def _update_aether_job(job_id: str, **updates: Any) -> None:
+    with AETHER_JOBS_LOCK:
+        job = AETHER_JOBS.get(job_id)
+        if not job:
+            return
+        job.update(updates)
+        job["updated_at"] = _now()
+
+
+def _read_meminfo_bytes() -> dict[str, int]:
+    values: dict[str, int] = {}
+    try:
+        with open("/proc/meminfo", "r", encoding="utf-8") as meminfo:
+            for line in meminfo:
+                key, raw_value = line.split(":", 1)
+                parts = raw_value.strip().split()
+                if not parts:
+                    continue
+                values[key] = int(parts[0]) * 1024
+    except Exception:
+        logger.debug("Could not read /proc/meminfo", exc_info=True)
+    return values
+
+
+def _read_process_rss_bytes() -> int | None:
+    try:
+        with open("/proc/self/status", "r", encoding="utf-8") as status_file:
+            for line in status_file:
+                if line.startswith("VmRSS:"):
+                    return int(line.split()[1]) * 1024
+    except Exception:
+        logger.debug("Could not read process RSS", exc_info=True)
+    return None
+
+
+def _collect_resource_snapshot() -> dict[str, Any]:
+    meminfo = _read_meminfo_bytes()
+    total = meminfo.get("MemTotal")
+    available = meminfo.get("MemAvailable")
+    used = total - available if total is not None and available is not None else None
+    snapshot: dict[str, Any] = {
+        "time": _now(),
+        "ram": {
+            "total": total,
+            "available": available,
+            "used": used,
+            "process_rss": _read_process_rss_bytes(),
+        },
+        "cuda_available": False,
+        "gpus": [],
+    }
+
+    try:
+        import torch
+
+        snapshot["cuda_available"] = torch.cuda.is_available()
+        if torch.cuda.is_available():
+            for index in range(torch.cuda.device_count()):
+                with torch.cuda.device(index):
+                    free_bytes, total_bytes = torch.cuda.mem_get_info(index)
+                    snapshot["gpus"].append({
+                        "index": index,
+                        "name": torch.cuda.get_device_name(index),
+                        "free": free_bytes,
+                        "total": total_bytes,
+                        "used": total_bytes - free_bytes,
+                        "allocated": torch.cuda.memory_allocated(index),
+                        "reserved": torch.cuda.memory_reserved(index),
+                    })
+    except Exception:
+        logger.debug("Could not collect CUDA memory snapshot", exc_info=True)
+
+    return snapshot
+
+
+def _append_resource_log(job_id: str, stage: str, message: str) -> None:
+    entry = {
+        "time": _now(),
+        "stage": stage,
+        "message": message,
+        "snapshot": _collect_resource_snapshot(),
+    }
+    with SEGMENTATION_JOBS_LOCK:
+        job = SEGMENTATION_JOBS.get(job_id)
+        if not job:
+            return
+        resource_log = job.setdefault("resource_log", [])
+        resource_log.append(entry)
+        if len(resource_log) > MAX_RESOURCE_LOG_ENTRIES:
+            del resource_log[:-MAX_RESOURCE_LOG_ENTRIES]
+        job["resource_snapshot"] = entry["snapshot"]
+        job["updated_at"] = _now()
+
+
+def _start_resource_monitor(job_id: str) -> tuple[threading.Event, threading.Thread]:
+    stop_event = threading.Event()
+
+    def monitor() -> None:
+        while not stop_event.wait(2):
+            job = _get_job(job_id)
+            if not job or job.get("status") in TERMINAL_STATUSES:
+                return
+            _append_resource_log(
+                job_id,
+                job.get("stage") or "Running",
+                job.get("message") or "Resource snapshot",
+            )
+
+    thread = threading.Thread(
+        target=monitor,
+        name=f"segment-resource-monitor-{job_id[:8]}",
+        daemon=True,
+    )
+    thread.start()
+    return stop_event, thread
+
+
+def _prune_jobs() -> None:
+    with SEGMENTATION_JOBS_LOCK:
+        if len(SEGMENTATION_JOBS) <= MAX_JOB_HISTORY:
+            return
+
+        finished = [
+            job
+            for job in SEGMENTATION_JOBS.values()
+            if job.get("status") in TERMINAL_STATUSES
+        ]
+        finished.sort(key=lambda item: item.get("completed_at") or item["created_at"])
+        remove_count = len(SEGMENTATION_JOBS) - MAX_JOB_HISTORY
+        for job in finished[:remove_count]:
+            SEGMENTATION_JOBS.pop(job["id"], None)
+
+
+def _clamp_float(value: Any, minimum: float, maximum: float, fallback: float) -> float:
+    try:
+        return min(max(float(value), minimum), maximum)
+    except (TypeError, ValueError):
+        return fallback
+
+
+def _clamp_int(value: Any, minimum: int, maximum: int, fallback: int) -> int:
+    try:
+        return min(max(int(value), minimum), maximum)
+    except (TypeError, ValueError):
+        return fallback
+
+
+def _build_segmentation_options(
+    sam_mask_threshold: float,
+    sam_multimask_output: bool,
+    mask_min_area: int,
+    mask_cleanup_px: int,
+    mask_expand_px: int,
+    refinement_passes: int,
+    refinement_mode: str,
+) -> dict[str, Any]:
+    options = dict(DEFAULT_SEGMENTATION_OPTIONS)
+    options.update({
+        "sam_mask_threshold": _clamp_float(
+            sam_mask_threshold,
+            -2.0,
+            2.0,
+            DEFAULT_SEGMENTATION_OPTIONS["sam_mask_threshold"],
+        ),
+        "sam_multimask_output": bool(sam_multimask_output),
+        "mask_min_area": _clamp_int(
+            mask_min_area,
+            0,
+            2_000_000,
+            DEFAULT_SEGMENTATION_OPTIONS["mask_min_area"],
+        ),
+        "mask_cleanup_px": _clamp_int(
+            mask_cleanup_px,
+            0,
+            31,
+            DEFAULT_SEGMENTATION_OPTIONS["mask_cleanup_px"],
+        ),
+        "mask_expand_px": _clamp_int(
+            mask_expand_px,
+            -31,
+            31,
+            DEFAULT_SEGMENTATION_OPTIONS["mask_expand_px"],
+        ),
+        "refinement_passes": _clamp_int(
+            refinement_passes,
+            0,
+            3,
+            DEFAULT_SEGMENTATION_OPTIONS["refinement_passes"],
+        ),
+        "refinement_mode": str(refinement_mode or "").lower(),
+    })
+    if options["refinement_mode"] not in {"intersection", "union", "replace"}:
+        options["refinement_mode"] = DEFAULT_SEGMENTATION_OPTIONS["refinement_mode"]
+    return options
+
+
+def _encode_png_base64(image: Image.Image) -> str:
+    buffer = io.BytesIO()
+    image.save(buffer, format="PNG")
+    return base64.b64encode(buffer.getvalue()).decode()
+
+
+def _mask_to_png_base64(mask: np.ndarray) -> str:
+    mask_uint8 = ((mask > 0) * 255).astype(np.uint8)
+    return _encode_png_base64(Image.fromarray(mask_uint8))
+
+
+def _build_segment_response(results: dict[str, Any], prompt: str) -> dict[str, Any]:
+    response_data = {
+        "success": True,
+        "prompt": prompt,
+        "original_size": results["original_size"],
+        "uploaded_size": results.get("uploaded_size"),
+        "sam_prompts": results.get("sam_prompts"),
+        "model_output": results.get("model_output"),
+        "model_outputs": results.get("model_outputs"),
+        "options": results.get("options"),
+        "refinement_passes_completed": results.get("refinement_passes_completed"),
+    }
+
+    if "mask" in results:
+        response_data["mask_base64"] = _mask_to_png_base64(results["mask"])
+
+    if "visualization" in results:
+        response_data["visualization_base64"] = _encode_png_base64(
+            results["visualization"],
+        )
+
+    if "segmented_image" in results:
+        response_data["segmented_image_base64"] = _encode_png_base64(
+            results["segmented_image"],
+        )
+
+    pass_outputs = []
+    for pass_output in results.get("pass_outputs", []):
+        encoded_pass = {
+            "pass_number": pass_output.get("pass_number"),
+            "total_passes": pass_output.get("total_passes"),
+            "prompt_count": pass_output.get("prompt_count"),
+            "model_output": pass_output.get("model_output"),
+            "sam_prompts": pass_output.get("sam_prompts"),
+        }
+        if "mask" in pass_output:
+            encoded_pass["mask_base64"] = _mask_to_png_base64(pass_output["mask"])
+        if "visualization" in pass_output:
+            encoded_pass["visualization_base64"] = _encode_png_base64(
+                pass_output["visualization"],
+            )
+        if "segmented_image" in pass_output:
+            encoded_pass["segmented_image_base64"] = _encode_png_base64(
+                pass_output["segmented_image"],
+            )
+        pass_outputs.append(encoded_pass)
+
+    if pass_outputs:
+        response_data["pass_outputs"] = pass_outputs
+
+    return response_data
+
+
+def _run_segment_job(
+    job_id: str,
+    image_data: bytes,
+    prompt: str,
+    options: dict[str, Any],
+) -> None:
+    _update_job(
+        job_id,
+        status="queued",
+        progress=1,
+        stage="Queued",
+        message="Waiting for the segmentation worker",
+    )
+    _append_resource_log(job_id, "Queued", "Waiting for the segmentation worker")
+
+    with SEGMENTATION_RUN_LOCK:
+        stop_monitor, monitor_thread = _start_resource_monitor(job_id)
+        try:
+            def progress_callback(progress: int, message: str) -> None:
+                job = _get_job(job_id) or {}
+                next_progress = max(
+                    int(job.get("progress") or 0),
+                    max(0, min(99, int(progress))),
+                )
+                _update_job(
+                    job_id,
+                    status="running",
+                    progress=next_progress,
+                    stage=message,
+                    message=message,
+                )
+                _append_resource_log(job_id, message, message)
+
+            def scaled_progress(start: int, end: int) -> Any:
+                span = end - start
+
+                def _callback(progress: int, message: str) -> None:
+                    scaled = start + int((max(0, min(100, progress)) / 100) * span)
+                    progress_callback(scaled, message)
+
+                return _callback
+
+            _update_job(
+                job_id,
+                status="running",
+                progress=4,
+                stage="Validating image",
+                message="Reading uploaded image",
+                started_at=_now(),
+            )
+            _append_resource_log(job_id, "Validating image", "Reading uploaded image")
+            image = Image.open(io.BytesIO(image_data)).convert("RGB")
+            if image.size[0] * image.size[1] > 25000000:
+                raise ValueError("Image too large. Maximum ~5000x5000 pixels.")
+
+            engine = get_inference_engine(
+                progress_callback=scaled_progress(5, 45),
+            )
+            progress_callback(45, "Models ready")
+
+            results = engine.segment(
+                image,
+                prompt,
+                return_visualization=True,
+                progress_callback=scaled_progress(45, 98),
+                options=options,
+            )
+            if not results["success"]:
+                raise RuntimeError(results.get("error") or "Segmentation failed")
+
+            _update_job(
+                job_id,
+                status="running",
+                progress=99,
+                stage="Encoding result",
+                message="Encoding mask and visualization",
+            )
+            _append_resource_log(job_id, "Encoding result", "Encoding mask and visualization")
+            response_data = _build_segment_response(results, prompt)
+            _update_job(
+                job_id,
+                status="succeeded",
+                progress=100,
+                stage="Complete",
+                message="Segmentation complete",
+                result=response_data,
+                completed_at=_now(),
+            )
+            logger.info("Segmentation job %s completed", job_id)
+        except Exception as exc:
+            logger.error("Segmentation job %s failed: %s", job_id, exc)
+            _append_resource_log(job_id, "Failed", str(exc))
+            _update_job(
+                job_id,
+                status="failed",
+                progress=100,
+                stage="Failed",
+                message=str(exc),
+                error=str(exc),
+                completed_at=_now(),
+            )
+        finally:
+            stop_monitor.set()
+            monitor_thread.join(timeout=1)
+            _append_resource_log(job_id, "Finished", "Final resource snapshot")
+
+
+def _callback_url(crop_id: str) -> str | None:
+    base_url = (settings.ultra_sim_callback_base_url or "").strip().rstrip("/")
+    if not base_url:
+        return None
+    parsed = urlparse(base_url)
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        raise RuntimeError("ULTRA_SIM_CALLBACK_BASE_URL must be an absolute http(s) URL")
+    return f"{base_url}/api/aether/handoff/{quote(crop_id, safe='')}"
+
+
+def _push_handoff(crop_id: str, bundle: dict[str, Any]) -> dict[str, Any]:
+    callback_url = _callback_url(crop_id)
+    if callback_url is None:
+        return {
+            "status": "not_configured",
+            "message": "ULTRA_SIM_CALLBACK_BASE_URL is not configured",
+        }
+
+    headers = {"Content-Type": "application/json"}
+    if settings.ultra_sim_callback_token:
+        headers["X-Aether-Handoff-Token"] = settings.ultra_sim_callback_token
+    request = Request(
+        callback_url,
+        data=json.dumps(bundle, separators=(",", ":")).encode("utf-8"),
+        headers=headers,
+        method="POST",
+    )
+    with urlopen(request, timeout=settings.ultra_sim_callback_timeout) as response:
+        response_payload = json.loads(response.read().decode("utf-8"))
+        return {
+            "status": "accepted",
+            "http_status": response.status,
+            "local_job_id": response_payload.get("job_id"),
+            "status_url": response_payload.get("status_url"),
+        }
+
+
+def _run_aether_job(
+    job_id: str,
+    image_data: bytes,
+    crop_id: str,
+    filename: str,
+) -> None:
+    _update_aether_job(
+        job_id,
+        status="queued",
+        progress=1,
+        stage="Queued",
+        message="Waiting for the AETHER worker",
+        started_at=_now(),
+    )
+    with SEGMENTATION_RUN_LOCK:
+        try:
+            image = Image.open(io.BytesIO(image_data)).convert("RGB")
+            if image.size[0] * image.size[1] > 25000000:
+                raise ValueError("Image too large. Maximum ~5000x5000 pixels.")
+
+            def load_progress(progress: int, message: str) -> None:
+                _update_aether_job(
+                    job_id,
+                    status="running",
+                    progress=max(2, min(5, int(progress * 0.05))),
+                    stage=message,
+                    message="Loading shared inference models",
+                )
+
+            engine = get_inference_engine(progress_callback=load_progress)
+            semantic_masks: list[SemanticMask] = []
+            class_items = list(CLASS_PROMPTS.items())
+            class_count = len(class_items)
+
+            for index, (class_name, class_prompt) in enumerate(class_items):
+                start = 5 + int((index / class_count) * 82)
+                end = 5 + int(((index + 1) / class_count) * 82)
+
+                def progress_callback(
+                    progress: int,
+                    message: str,
+                    *,
+                    progress_start: int = start,
+                    progress_end: int = end,
+                    current_class: str = class_name,
+                    class_index: int = index,
+                ) -> None:
+                    scaled = progress_start + int(
+                        (max(0, min(100, progress)) / 100)
+                        * (progress_end - progress_start)
+                    )
+                    _update_aether_job(
+                        job_id,
+                        status="running",
+                        progress=min(scaled, 94),
+                        stage=f"{current_class}: {message}",
+                        message=f"Class {class_index + 1} of {class_count}",
+                    )
+
+                result = engine.segment(
+                    image,
+                    class_prompt,
+                    return_visualization=False,
+                    progress_callback=progress_callback,
+                )
+                if not result.get("success"):
+                    raise RuntimeError(
+                        f"{class_name} inference failed: "
+                        f"{result.get('error') or 'unknown error'}"
+                    )
+                semantic_masks.append(
+                    SemanticMask(
+                        class_name=class_name,
+                        prompt=class_prompt,
+                        mask=np.asarray(result["mask"]).astype(np.uint8),
+                    )
+                )
+
+            _update_aether_job(
+                job_id,
+                status="running",
+                progress=95,
+                stage="Building handoff",
+                message="Deduplicating masks and calculating class vectors",
+            )
+            processed_image = engine.preprocess_image(image)
+            bundle = build_handoff_bundle(
+                crop_id=crop_id,
+                source_filename=filename,
+                source_image_bytes=image_data,
+                image=processed_image,
+                semantic_masks=semantic_masks,
+                min_component_area=settings.aether_min_component_area,
+                dedup_iou_threshold=settings.aether_dedup_iou_threshold,
+                dedup_containment_threshold=settings.aether_dedup_containment_threshold,
+                classification_smoothing=settings.aether_classification_smoothing,
+            )
+            _update_aether_job(job_id, bundle=bundle)
+            _update_aether_job(
+                job_id,
+                status="running",
+                progress=98,
+                stage="Pushing to Ultra-Sim",
+                message="Sending masks and classifications to the laptop",
+            )
+            handoff = _push_handoff(crop_id, bundle)
+            result_summary = {
+                "success": True,
+                "crop_id": crop_id,
+                "segment_count": bundle["segment_count"],
+                "classification_counts": bundle["classification_counts"],
+                "visualization_base64": bundle["whole_scene_overlay_base64"],
+            }
+            _update_aether_job(
+                job_id,
+                status="succeeded",
+                progress=100,
+                stage="Complete",
+                message=(
+                    "Masks accepted by Ultra-Sim"
+                    if handoff["status"] == "accepted"
+                    else "Inference complete; laptop callback is not configured"
+                ),
+                result=result_summary,
+                handoff=handoff,
+                bundle=bundle,
+                completed_at=_now(),
+            )
+        except Exception as exc:
+            logger.exception("AETHER handoff job %s failed", job_id)
+            _update_aether_job(
+                job_id,
+                status="failed",
+                progress=100,
+                stage="Failed",
+                message=str(exc),
+                error=str(exc),
+                completed_at=_now(),
+            )
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """FastAPI lifespan context manager for startup/shutdown."""
-    # Startup
     logger.info("Think2Seg API starting...")
-    try:
-        engine = get_inference_engine()
-        logger.info(f"Model status: {engine.get_status()}")
-    except Exception as e:
-        logger.error(f"Failed to initialize model: {e}")
-        raise
-
+    logger.info("Model will be loaded lazily on the first segmentation job.")
     yield
-
-    # Shutdown
     logger.info("Think2Seg API shutting down...")
 
 
@@ -76,10 +701,10 @@ app.add_middleware(
 @app.get("/health")
 async def health_check():
     """Health check endpoint."""
-    engine = get_inference_engine()
+    status = get_inference_status()
     return {
         "status": "healthy",
-        "model_loaded": engine.loaded,
+        "model_loaded": status["loaded"],
         "model": settings.model_path,
     }
 
@@ -87,14 +712,20 @@ async def health_check():
 @app.get("/status")
 async def get_status():
     """Get model status."""
-    engine = get_inference_engine()
-    return engine.get_status()
+    return get_inference_status()
 
 
 @app.post("/segment")
 async def segment_image(
     file: UploadFile = File(...),
     prompt: str = Form(...),
+    sam_mask_threshold: float = Form(DEFAULT_SEGMENTATION_OPTIONS["sam_mask_threshold"]),
+    sam_multimask_output: bool = Form(DEFAULT_SEGMENTATION_OPTIONS["sam_multimask_output"]),
+    mask_min_area: int = Form(DEFAULT_SEGMENTATION_OPTIONS["mask_min_area"]),
+    mask_cleanup_px: int = Form(DEFAULT_SEGMENTATION_OPTIONS["mask_cleanup_px"]),
+    mask_expand_px: int = Form(DEFAULT_SEGMENTATION_OPTIONS["mask_expand_px"]),
+    refinement_passes: int = Form(DEFAULT_SEGMENTATION_OPTIONS["refinement_passes"]),
+    refinement_mode: str = Form(DEFAULT_SEGMENTATION_OPTIONS["refinement_mode"]),
 ):
     """
     Segment satellite image based on natural language prompt.
@@ -108,7 +739,8 @@ async def segment_image(
     """
     try:
         # Validate file
-        if not file.content_type.startswith("image/"):
+        content_type = file.content_type or ""
+        if not content_type.startswith("image/"):
             raise HTTPException(status_code=400, detail="File must be an image")
 
         # Read and validate image
@@ -127,47 +759,195 @@ async def segment_image(
 
         # Get inference engine
         engine = get_inference_engine()
+        options = _build_segmentation_options(
+            sam_mask_threshold,
+            sam_multimask_output,
+            mask_min_area,
+            mask_cleanup_px,
+            mask_expand_px,
+            refinement_passes,
+            refinement_mode,
+        )
 
         # Run segmentation
-        results = engine.segment(image, prompt, return_visualization=True)
+        results = engine.segment(
+            image,
+            prompt,
+            return_visualization=True,
+            options=options,
+        )
 
         if not results["success"]:
             raise HTTPException(status_code=500, detail=results.get("error"))
 
-        # Convert results for JSON response
-        response_data = {
-            "success": True,
-            "prompt": prompt,
-            "original_size": results["original_size"],
-        }
-
-        # Encode mask as base64
-        if "mask" in results:
-            mask = results["mask"]
-            mask_uint8 = (mask * 255).astype(np.uint8)
-            mask_image = Image.fromarray(mask_uint8)
-            mask_buffer = io.BytesIO()
-            mask_image.save(mask_buffer, format="PNG")
-            response_data["mask_base64"] = base64.b64encode(
-                mask_buffer.getvalue()
-            ).decode()
-
-        # Encode visualization as base64
-        if "visualization" in results:
-            viz_image = results["visualization"]
-            viz_buffer = io.BytesIO()
-            viz_image.save(viz_buffer, format="PNG")
-            response_data["visualization_base64"] = base64.b64encode(
-                viz_buffer.getvalue()
-            ).decode()
-
-        return JSONResponse(response_data)
+        return JSONResponse(_build_segment_response(results, prompt))
 
     except HTTPException:
         raise
     except Exception as e:
         logger.error(f"Error in segment endpoint: {e}")
         raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/segment/jobs")
+async def create_segment_job(
+    background_tasks: BackgroundTasks,
+    file: UploadFile = File(...),
+    prompt: str = Form(...),
+    sam_mask_threshold: float = Form(DEFAULT_SEGMENTATION_OPTIONS["sam_mask_threshold"]),
+    sam_multimask_output: bool = Form(DEFAULT_SEGMENTATION_OPTIONS["sam_multimask_output"]),
+    mask_min_area: int = Form(DEFAULT_SEGMENTATION_OPTIONS["mask_min_area"]),
+    mask_cleanup_px: int = Form(DEFAULT_SEGMENTATION_OPTIONS["mask_cleanup_px"]),
+    mask_expand_px: int = Form(DEFAULT_SEGMENTATION_OPTIONS["mask_expand_px"]),
+    refinement_passes: int = Form(DEFAULT_SEGMENTATION_OPTIONS["refinement_passes"]),
+    refinement_mode: str = Form(DEFAULT_SEGMENTATION_OPTIONS["refinement_mode"]),
+):
+    """Create an asynchronous segmentation job and return its status URL."""
+    content_type = file.content_type or ""
+    if not content_type.startswith("image/"):
+        raise HTTPException(status_code=400, detail="File must be an image")
+
+    clean_prompt = prompt.strip()
+    if not clean_prompt:
+        raise HTTPException(status_code=400, detail="Prompt is required")
+
+    image_data = await file.read()
+    if not image_data:
+        raise HTTPException(status_code=400, detail="File is empty")
+
+    options = _build_segmentation_options(
+        sam_mask_threshold,
+        sam_multimask_output,
+        mask_min_area,
+        mask_cleanup_px,
+        mask_expand_px,
+        refinement_passes,
+        refinement_mode,
+    )
+    job_id = uuid.uuid4().hex
+    job = {
+        "id": job_id,
+        "filename": file.filename,
+        "prompt": clean_prompt,
+        "options": options,
+        "status": "queued",
+        "progress": 0,
+        "stage": "Queued",
+        "message": "Waiting to start",
+        "error": None,
+        "result": None,
+        "created_at": _now(),
+        "started_at": None,
+        "completed_at": None,
+        "updated_at": _now(),
+    }
+    with SEGMENTATION_JOBS_LOCK:
+        SEGMENTATION_JOBS[job_id] = job
+    _prune_jobs()
+
+    background_tasks.add_task(_run_segment_job, job_id, image_data, clean_prompt, options)
+    return JSONResponse(_serialize_job(job))
+
+
+@app.get("/segment/jobs/{job_id}")
+async def get_segment_job(job_id: str):
+    """Get progress and result for an asynchronous segmentation job."""
+    job = _get_job(job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail="Segmentation job not found")
+    return JSONResponse(_serialize_job(job))
+
+
+@app.get("/segment/jobs")
+async def list_segment_jobs():
+    """List recent segmentation jobs."""
+    with SEGMENTATION_JOBS_LOCK:
+        jobs = [_serialize_job(job) for job in SEGMENTATION_JOBS.values()]
+    jobs.sort(key=lambda item: item["created_at"], reverse=True)
+    return {"jobs": jobs}
+
+
+@app.post("/aether/jobs")
+async def create_aether_job(
+    background_tasks: BackgroundTasks,
+    file: UploadFile = File(...),
+    crop_id: str = Form(...),
+):
+    """Run all broad-class prompts and push masks/classification to Ultra-Sim."""
+    content_type = file.content_type or ""
+    if not content_type.startswith("image/"):
+        raise HTTPException(status_code=400, detail="File must be an image")
+    clean_crop_id = crop_id.strip()
+    if not clean_crop_id or len(clean_crop_id) > 64:
+        raise HTTPException(status_code=400, detail="A valid crop_id is required")
+    if not all(character.isalnum() or character in "_-" for character in clean_crop_id):
+        raise HTTPException(status_code=400, detail="crop_id contains unsupported characters")
+    image_data = await file.read()
+    if not image_data:
+        raise HTTPException(status_code=400, detail="File is empty")
+
+    job_id = uuid.uuid4().hex
+    job = {
+        "id": job_id,
+        "filename": file.filename or "combined.png",
+        "crop_id": clean_crop_id,
+        "status": "queued",
+        "progress": 0,
+        "stage": "Queued",
+        "message": "Waiting to start",
+        "error": None,
+        "result": None,
+        "handoff": None,
+        "created_at": _now(),
+        "started_at": None,
+        "completed_at": None,
+        "updated_at": _now(),
+    }
+    with AETHER_JOBS_LOCK:
+        AETHER_JOBS[job_id] = job
+    background_tasks.add_task(
+        _run_aether_job,
+        job_id,
+        image_data,
+        clean_crop_id,
+        file.filename or "combined.png",
+    )
+    return JSONResponse(_serialize_aether_job(job))
+
+
+@app.get("/aether/jobs/{job_id}")
+async def get_aether_job(job_id: str):
+    """Return one remote AETHER handoff job."""
+    job = _get_aether_job(job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail="AETHER job not found")
+    return JSONResponse(_serialize_aether_job(job))
+
+
+@app.get("/aether/jobs")
+async def list_aether_jobs():
+    """List remote AETHER handoff jobs without returning mask bundles."""
+    with AETHER_JOBS_LOCK:
+        jobs = [_serialize_aether_job(job) for job in AETHER_JOBS.values()]
+    jobs.sort(key=lambda item: item["created_at"], reverse=True)
+    return {"jobs": jobs}
+
+
+@app.post("/aether/jobs/{job_id}/handoff")
+async def retry_aether_handoff(job_id: str):
+    """Retry delivery of a completed bundle to Ultra-Sim."""
+    job = _get_aether_job(job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail="AETHER job not found")
+    bundle = job.get("bundle")
+    if not isinstance(bundle, dict):
+        raise HTTPException(status_code=409, detail="AETHER bundle is not ready")
+    try:
+        handoff = _push_handoff(str(job["crop_id"]), bundle)
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=str(exc))
+    _update_aether_job(job_id, handoff=handoff)
+    return handoff
 
 
 @app.post("/segment-multiple")

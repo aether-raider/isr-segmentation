@@ -3,6 +3,9 @@ FROM nvidia/cuda:12.2.2-runtime-ubuntu22.04
 
 WORKDIR /app
 
+ENV API_HOST=0.0.0.0
+ENV API_PORT=8123
+
 # Install Python and dependencies non-interactively
 ENV DEBIAN_FRONTEND=noninteractive
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -13,6 +16,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential \
     cmake \
     git \
+    wget \
     libopencv-dev \
     && rm -rf /var/lib/apt/lists/*
 
@@ -26,10 +30,28 @@ RUN ln -s /usr/bin/python3.10 /usr/bin/python
 COPY backend/requirements.txt .
 RUN pip install --no-cache-dir --upgrade pip setuptools wheel packaging
 
-# Install torch and torchvision from PyTorch's CUDA 12.2 index to ensure compatible CUDA wheels
-# Using the official PyTorch wheel index for cu122
-RUN pip install --no-cache-dir --extra-index-url https://download.pytorch.org/whl/cu122 \
+# Install torch and torchvision from PyTorch's CUDA 12 wheel index.
+# cu122 does not publish wheels for this Python stack; cu121 is the nearest
+# official CUDA 12 wheel set and avoids accidentally resolving CUDA 13 wheels.
+RUN pip install --no-cache-dir --index-url https://download.pytorch.org/whl/cu121 \
     "torch" "torchvision"
+
+# Install SAM2 and its checkpoints. The CUDA extension is optional for image
+# inference and requires nvcc, which is not present in this runtime image.
+ENV SAM2_ROOT=/opt/sam2
+ENV SAM2_BUILD_CUDA=0
+ARG SAM2_MODEL_SIZE=base_plus
+RUN git clone --depth 1 https://github.com/facebookresearch/sam2.git ${SAM2_ROOT} \
+    && pip install --no-cache-dir -e ${SAM2_ROOT} \
+    && case "${SAM2_MODEL_SIZE}" in \
+        tiny) SAM2_CKPT="sam2.1_hiera_tiny.pt" ;; \
+        small) SAM2_CKPT="sam2.1_hiera_small.pt" ;; \
+        base_plus) SAM2_CKPT="sam2.1_hiera_base_plus.pt" ;; \
+        large) SAM2_CKPT="sam2.1_hiera_large.pt" ;; \
+        *) echo "Invalid SAM2_MODEL_SIZE: ${SAM2_MODEL_SIZE}" && exit 1 ;; \
+    esac \
+    && wget -O "${SAM2_ROOT}/checkpoints/${SAM2_CKPT}" \
+        "https://dl.fbaipublicfiles.com/segment_anything_2/092824/${SAM2_CKPT}"
 
 # Install remaining dependencies
 RUN pip install --no-cache-dir -r requirements.txt
@@ -37,12 +59,12 @@ RUN pip install --no-cache-dir -r requirements.txt
 # Copy backend code
 COPY backend/ .
 
-# Expose port
-EXPOSE 8000
+# Expose the default API port. Runtime port can be changed with API_PORT.
+EXPOSE 8123
 
 # Health check
 HEALTHCHECK --interval=30s --timeout=10s --start-period=40s --retries=3 \
-    CMD python -c "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')" || exit 1
+    CMD python -c "import os, urllib.request; port=os.getenv('API_PORT', '8123'); urllib.request.urlopen(f'http://localhost:{port}/health')" || exit 1
 
 # Run server
-CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000"]
+CMD ["sh", "-c", "uvicorn main:app --host ${API_HOST:-0.0.0.0} --port ${API_PORT:-8123}"]

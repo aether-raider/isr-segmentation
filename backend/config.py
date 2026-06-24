@@ -15,9 +15,11 @@ class Settings(BaseSettings):
 
     # API Configuration
     api_host: str = "0.0.0.0"
-    api_port: int = 8000
+    api_port: int = 8123
     debug: bool = False
-    cors_origins: list[str] = ["http://localhost:3000", "http://localhost:5173"]
+    frontend_port: int = 3123
+    vite_port: int = 5173
+    cors_origins: list[str] = Field(default_factory=list)
 
     # Model Configuration
     model_name: str = "Think2Seg-RS-7B"  # or "Think2Seg-RS-3B"
@@ -28,16 +30,32 @@ class Settings(BaseSettings):
         description="Optional Hugging Face access token for gated repos",
     )
     device: str = "cuda"  # or "cpu"
+    model_device_map: str = "auto"  # auto shards the VLM across visible GPUs
     dtype: str = "bfloat16"  # or "float32"
 
     # SAM2 Configuration
     sam2_model_size: str = "base_plus"  # tiny, small, base_plus, large
     sam2_device: str = "cuda"
+    sam2_root: str = "/opt/sam2"
+    sam2_checkpoint: Optional[str] = None
+    sam2_config: Optional[str] = None
 
     # Inference Settings
     max_image_size: int = 1024  # Maximum image dimension
     inference_timeout: int = 300  # seconds
     batch_size: int = 1
+    max_new_tokens: int = 1024
+    clear_cuda_cache_after_run: bool = True
+    enable_tf32: bool = True
+    aether_min_component_area: int = 50
+    aether_dedup_iou_threshold: float = 0.55
+    aether_dedup_containment_threshold: float = 0.85
+    aether_classification_smoothing: float = 0.01
+
+    # Ultra-Sim callback handoff
+    ultra_sim_callback_base_url: Optional[str] = None
+    ultra_sim_callback_token: Optional[str] = None
+    ultra_sim_callback_timeout: int = 60
 
     # Model Caching
     use_cache: bool = True
@@ -54,6 +72,14 @@ class Settings(BaseSettings):
                 self.model_path = "RicardoString/Think2Seg-RS-3B"
             else:
                 self.model_path = "RicardoString/Think2Seg-RS-7B"
+
+        if not self.cors_origins:
+            self.cors_origins = [
+                f"http://localhost:{self.frontend_port}",
+                f"http://127.0.0.1:{self.frontend_port}",
+                f"http://localhost:{self.vite_port}",
+                f"http://127.0.0.1:{self.vite_port}",
+            ]
 
 
 settings = Settings()

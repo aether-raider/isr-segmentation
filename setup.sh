@@ -1,10 +1,10 @@
 #!/bin/bash
-# Think2Seg Demo - Development Setup Script
+# ISR Demo - Development Setup Script
 # Automatically sets up both backend and frontend for local development
 
 set -e
 
-echo "🚀 Think2Seg Demo - Development Setup"
+echo "ISR Demo - Development Setup"
 echo "======================================"
 echo ""
 
@@ -91,8 +91,8 @@ echo "   cd frontend"
 echo "   npm run dev"
 echo ""
 echo -e "${BLUE}Then open:${NC}"
-echo "   http://localhost:5173 (Frontend)"
-echo "   http://localhost:8000 (Backend)"
+echo "   http://localhost:${VITE_PORT:-5173} (Frontend)"
+echo "   http://localhost:${API_PORT:-8123} (Backend)"
 echo ""
 echo -e "${YELLOW}Note: First run will download models (~15-20 minutes)${NC}"
 echo ""

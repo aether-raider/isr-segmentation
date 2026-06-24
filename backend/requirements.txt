@@ -7,6 +7,7 @@ pydantic-settings==2.1.0
 # install "torch" and "torchvision" in the Dockerfile to ensure matching CUDA builds
 transformers==4.49.0
 accelerate>=0.26.0
+qwen-vl-utils>=0.0.8
 pillow==9.5.0
-numpy==1.24.3
+numpy==1.24.4
 opencv-python==4.8.1.78

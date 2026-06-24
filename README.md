@@ -159,6 +159,12 @@ Frontend will be available at `http://localhost:5173`
     -F "prompt=buildings in urban areas"
   ```
 
+- `POST /aether/jobs` - Run all 12 AETHER broad classes and push the artifact
+  bundle to an existing Ultra-Sim crop on the configured laptop callback.
+- `GET /aether/jobs/{job_id}` - Poll remote segmentation, classification, and
+  callback progress.
+- `POST /aether/jobs/{job_id}/handoff` - Retry delivery of a completed bundle.
+
 - `POST /segment-multiple` - Multiple prompts on single image
   ```bash
   curl -X POST "http://localhost:8000/segment-multiple" \
