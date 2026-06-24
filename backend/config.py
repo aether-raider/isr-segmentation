@@ -42,7 +42,6 @@ class Settings(BaseSettings):
 
     # Inference Settings
     max_image_size: int = 1024  # Maximum image dimension
-    inference_timeout: Optional[int] = None
     batch_size: int = 1
     max_new_tokens: int = 1024
     clear_cuda_cache_after_run: bool = True
@@ -56,7 +55,6 @@ class Settings(BaseSettings):
     # Ultra-Sim callback handoff
     ultra_sim_callback_base_url: Optional[str] = None
     ultra_sim_callback_token: Optional[str] = None
-    ultra_sim_callback_timeout: Optional[int] = None
 
     # Model Caching
     use_cache: bool = True

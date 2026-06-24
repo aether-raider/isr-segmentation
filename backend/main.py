@@ -499,6 +499,7 @@ def _build_segment_response(results: dict[str, Any], prompt: str) -> dict[str, A
             "prompt_count": pass_output.get("prompt_count"),
             "model_output": pass_output.get("model_output"),
             "sam_prompts": pass_output.get("sam_prompts"),
+            "target_numbers": pass_output.get("target_numbers"),
         }
         if "mask" in pass_output:
             encoded_pass["mask_base64"] = _mask_to_png_base64(pass_output["mask"])
@@ -654,7 +655,7 @@ def _run_segment_job(
             )
         finally:
             stop_monitor.set()
-            monitor_thread.join(timeout=1)
+            monitor_thread.join()
             _append_resource_log(job_id, "Finished", "Final resource snapshot")
 
 
@@ -685,7 +686,7 @@ def _push_handoff(crop_id: str, bundle: dict[str, Any]) -> dict[str, Any]:
         headers=headers,
         method="POST",
     )
-    with urlopen(request, timeout=settings.ultra_sim_callback_timeout) as response:
+    with urlopen(request) as response:
         response_payload = json.loads(response.read().decode("utf-8"))
         return {
             "status": "accepted",
@@ -1232,7 +1233,6 @@ async def get_config():
         "device": settings.device,
         "dtype": settings.dtype,
         "max_image_size": settings.max_image_size,
-        "inference_timeout": settings.inference_timeout,
     }
 
 
