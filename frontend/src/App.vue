@@ -381,6 +381,51 @@
               </button>
             </div>
 
+            <div
+              v-if="selectedView === 'passes' && passOutputs(selectedJob).length"
+              class="mb-4 rounded-lg border border-slate-200 bg-slate-50 p-3"
+            >
+              <div class="flex items-center justify-between gap-3">
+                <div>
+                  <p class="text-sm font-semibold text-slate-800">Segmented Output By Pass</p>
+                  <p class="text-xs text-slate-500">Each pass shows the segmented image after that pass has been combined and cleaned.</p>
+                </div>
+                <span class="rounded-md bg-white px-2 py-1 text-xs font-semibold text-slate-600">
+                  {{ selectedPassIndex + 1 }} of {{ passOutputs(selectedJob).length }}
+                </span>
+              </div>
+              <div class="mt-3 grid grid-cols-2 gap-3 sm:grid-cols-4">
+                <button
+                  v-for="(passOutput, index) in passOutputs(selectedJob)"
+                  :key="`pass-${passOutput.pass_number || index}`"
+                  type="button"
+                  :class="[
+                    'overflow-hidden rounded-lg border bg-white text-left transition hover:border-cyan-600',
+                    selectedPassIndex === index ? 'border-cyan-700 ring-2 ring-cyan-100' : 'border-slate-200'
+                  ]"
+                  @click="selectedPassIndex = index"
+                >
+                  <img
+                    v-if="passSegmentedImage(passOutput)"
+                    :src="passSegmentedImage(passOutput)"
+                    alt=""
+                    class="h-20 w-full bg-slate-950 object-contain"
+                  />
+                  <div v-else class="flex h-20 items-center justify-center bg-slate-100 text-xs text-slate-500">
+                    No image
+                  </div>
+                  <div class="p-2">
+                    <p class="text-xs font-semibold text-slate-800">
+                      Pass {{ passOutput.pass_number || index + 1 }}
+                    </p>
+                    <p class="mt-0.5 text-[11px] text-slate-500">
+                      {{ passOutput.prompt_count ?? 0 }} prompt targets
+                    </p>
+                  </div>
+                </button>
+              </div>
+            </div>
+
             <div class="overflow-hidden rounded-lg border border-slate-200 bg-slate-950">
               <img
                 v-if="selectedViewImage(selectedJob)"
@@ -582,11 +627,13 @@ import axios from 'axios'
 
 const MAX_FILE_SIZE = 25 * 1024 * 1024
 const POLL_INTERVAL_MS = 2000
+const POLL_TIMEOUT_MS = 60000
 const resultViews = [
   { id: 'before', label: 'Before' },
   { id: 'overlay', label: 'Mask Overlay' },
   { id: 'mask', label: 'Mask Only' },
-  { id: 'segmented', label: 'Segmented Image' }
+  { id: 'segmented', label: 'Segmented Image' },
+  { id: 'passes', label: 'Pass Outputs' }
 ]
 const defaultSegmentationSettings = {
   samMaskThreshold: 0,
@@ -616,6 +663,7 @@ export default {
     const queue = ref([])
     const selectedJobId = ref(null)
     const selectedView = ref('before')
+    const selectedPassIndex = ref(0)
     const currentJobId = ref(null)
     const isQueueRunning = ref(false)
     const isDragging = ref(false)
@@ -649,7 +697,8 @@ export default {
         before: 'Original image before segmentation',
         overlay: 'Image with segmentation mask overlay',
         mask: 'Segmentation mask only',
-        segmented: 'Segmented image cutout'
+        segmented: 'Segmented image cutout',
+        passes: 'Segmented image from the selected refinement pass'
       }
       return labels[selectedView.value] || 'Segmentation view'
     })
@@ -941,9 +990,21 @@ export default {
 
       while (true) {
         const jobPath = job.jobType === 'aether' ? 'aether/jobs' : 'segment/jobs'
-        const response = await axios.get(`/api/${jobPath}/${job.serverJobId}`, {
-          timeout: 10000
-        })
+        let response = null
+        try {
+          response = await axios.get(`/api/${jobPath}/${job.serverJobId}`, {
+            timeout: POLL_TIMEOUT_MS
+          })
+        } catch (err) {
+          if (!isTransientPollError(err)) {
+            throw err
+          }
+          job.status = job.status === 'uploading' ? 'running' : job.status
+          job.stage = 'Waiting for backend response'
+          job.message = getTransientPollMessage(err)
+          await wait(POLL_INTERVAL_MS)
+          continue
+        }
         applyServerJob(job, response.data)
 
         if (response.data.status === 'succeeded') {
@@ -1085,7 +1146,27 @@ export default {
       if (viewId === 'overlay') return Boolean(job.result?.visualization_base64)
       if (viewId === 'mask') return Boolean(job.result?.mask_base64)
       if (viewId === 'segmented') return Boolean(job.result?.segmented_image_base64)
+      if (viewId === 'passes') return passOutputs(job).length > 0
       return false
+    }
+
+    const passOutputs = (job) => {
+      return Array.isArray(job?.result?.pass_outputs) ? job.result.pass_outputs : []
+    }
+
+    const selectedPassOutput = (job) => {
+      const outputs = passOutputs(job)
+      if (!outputs.length) return null
+      const clampedIndex = Math.min(Math.max(selectedPassIndex.value, 0), outputs.length - 1)
+      if (clampedIndex !== selectedPassIndex.value) {
+        selectedPassIndex.value = clampedIndex
+      }
+      return outputs[clampedIndex]
+    }
+
+    const passSegmentedImage = (passOutput) => {
+      if (!passOutput?.segmented_image_base64) return ''
+      return `data:image/png;base64,${passOutput.segmented_image_base64}`
     }
 
     const selectedViewImage = (job) => {
@@ -1101,6 +1182,11 @@ export default {
       }
       if (selectedView.value === 'segmented' && job.result?.segmented_image_base64) {
         return `data:image/png;base64,${job.result.segmented_image_base64}`
+      }
+      if (selectedView.value === 'passes') {
+        const passOutput = selectedPassOutput(job)
+        const passImage = passSegmentedImage(passOutput)
+        if (passImage) return passImage
       }
       if (job.previewAvailable) {
         return job.previewUrl
@@ -1211,10 +1297,28 @@ export default {
       return [502, 503, 504].includes(Number(err.response?.status))
     }
 
+    const isTimeoutError = (err) => {
+      return err.code === 'ECONNABORTED' || String(err.message || '').toLowerCase().includes('timeout')
+    }
+
+    const isTransientPollError = (err) => {
+      return isTimeoutError(err) || isTransientGatewayError(err)
+    }
+
+    const getTransientPollMessage = (err) => {
+      if (isTimeoutError(err)) {
+        return `Status polling exceeded ${Math.round(POLL_TIMEOUT_MS / 1000)}s; keeping the job alive and retrying.`
+      }
+      return `Gateway returned ${err.response?.status}; keeping the job alive and retrying.`
+    }
+
     const getErrorMessage = (err) => {
       const status = Number(err.response?.status)
       if ([502, 503, 504].includes(status)) {
         return `Backend gateway error (${status}). The backend may still be starting or temporarily busy.`
+      }
+      if (isTimeoutError(err)) {
+        return 'Backend response timed out while the job was running. The queue will keep polling on retry.'
       }
       return err.response?.data?.detail || err.message || 'Segmentation failed'
     }
@@ -1246,6 +1350,7 @@ export default {
       queue,
       selectedJobId,
       selectedView,
+      selectedPassIndex,
       selectedViewAlt,
       selectedJob,
       currentJob,
@@ -1275,6 +1380,8 @@ export default {
       clearFinished,
       downloadJob,
       resultViewAvailable,
+      passOutputs,
+      passSegmentedImage,
       selectedViewImage,
       isJobBusy,
       statusText,
