@@ -12,6 +12,8 @@ services:
       - DEVICE=${DEVICE:-cuda}
       - DTYPE=${DTYPE:-bfloat16}
       - MODEL_DEVICE_MAP=${MODEL_DEVICE_MAP:-auto}
+      - MODEL_GPU_MEMORY_UTILIZATION=${MODEL_GPU_MEMORY_UTILIZATION:-0.95}
+      - MODEL_MAX_MEMORY_GB=${MODEL_MAX_MEMORY_GB:-0}
       - MODEL_NAME=${MODEL_NAME:-Think2Seg-RS-7B}
       - MODEL_PATH=${MODEL_PATH:-RicardoString/Think2Seg-RS-7B}
       - HF_TOKEN=${HF_TOKEN:-}

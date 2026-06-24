@@ -7,6 +7,8 @@ import base64
 import io
 import json
 import logging
+import os
+import subprocess
 import threading
 import time
 import uuid
@@ -17,6 +19,7 @@ from urllib.parse import quote, urlparse
 from urllib.request import Request, urlopen
 
 import numpy as np
+import cv2
 from fastapi import BackgroundTasks, FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse
@@ -44,6 +47,7 @@ MAX_JOB_HISTORY = 100
 MAX_RESOURCE_LOG_ENTRIES = 240
 MAX_RESOURCE_LOG_RESPONSE_ENTRIES = 120
 TERMINAL_STATUSES = {"succeeded", "failed"}
+_LAST_CPU_SAMPLE: tuple[int, int] | None = None
 
 
 class SegmentationRequest(BaseModel):
@@ -60,6 +64,22 @@ class SegmentationResponse(BaseModel):
     error: str = None
 
 
+class RuntimeSettingsRequest(BaseModel):
+    model_gpu_memory_utilization: float | None = None
+    model_max_memory_gb: float | None = None
+
+
+class PostprocessRequest(BaseModel):
+    options: dict[str, Any] | None = None
+    selected_target_numbers: list[int] | None = None
+    layer_number: int | None = None
+
+
+class RefineOutputRequest(BaseModel):
+    prompts: list[str] | None = None
+    options: dict[str, Any] | None = None
+
+
 def _now() -> float:
     return time.time()
 
@@ -70,6 +90,7 @@ def _serialize_job(job: dict[str, Any]) -> dict[str, Any]:
         "id": job["id"],
         "filename": job.get("filename"),
         "prompt": job.get("prompt"),
+        "prompts": job.get("prompts"),
         "options": job.get("options"),
         "status": job["status"],
         "progress": job.get("progress", 0),
@@ -162,6 +183,63 @@ def _read_process_rss_bytes() -> int | None:
     return None
 
 
+def _read_cpu_total_idle() -> tuple[int, int] | None:
+    try:
+        with open("/proc/stat", "r", encoding="utf-8") as stat_file:
+            parts = stat_file.readline().split()
+        if not parts or parts[0] != "cpu":
+            return None
+        values = [int(value) for value in parts[1:]]
+        idle = values[3] + (values[4] if len(values) > 4 else 0)
+        return sum(values), idle
+    except Exception:
+        logger.debug("Could not read /proc/stat", exc_info=True)
+    return None
+
+
+def _cpu_usage_percent() -> float | None:
+    global _LAST_CPU_SAMPLE
+    current = _read_cpu_total_idle()
+    if current is None:
+        return None
+    previous = _LAST_CPU_SAMPLE
+    _LAST_CPU_SAMPLE = current
+    if previous is None:
+        return None
+    total_delta = current[0] - previous[0]
+    idle_delta = current[1] - previous[1]
+    if total_delta <= 0:
+        return None
+    return max(0.0, min(100.0, (1 - (idle_delta / total_delta)) * 100))
+
+
+def _nvidia_smi_utilization() -> dict[int, float]:
+    try:
+        result = subprocess.run(
+            [
+                "nvidia-smi",
+                "--query-gpu=index,utilization.gpu",
+                "--format=csv,noheader,nounits",
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+    except Exception:
+        return {}
+
+    values = {}
+    for line in result.stdout.splitlines():
+        parts = [part.strip() for part in line.split(",")]
+        if len(parts) < 2:
+            continue
+        try:
+            values[int(parts[0])] = float(parts[1])
+        except ValueError:
+            continue
+    return values
+
+
 def _collect_resource_snapshot() -> dict[str, Any]:
     meminfo = _read_meminfo_bytes()
     total = meminfo.get("MemTotal")
@@ -175,6 +253,11 @@ def _collect_resource_snapshot() -> dict[str, Any]:
             "used": used,
             "process_rss": _read_process_rss_bytes(),
         },
+        "cpu": {
+            "usage_percent": _cpu_usage_percent(),
+            "load_average": os.getloadavg() if hasattr(os, "getloadavg") else None,
+            "count": os.cpu_count(),
+        },
         "cuda_available": False,
         "gpus": [],
     }
@@ -183,6 +266,7 @@ def _collect_resource_snapshot() -> dict[str, Any]:
         import torch
 
         snapshot["cuda_available"] = torch.cuda.is_available()
+        gpu_utilization = _nvidia_smi_utilization()
         if torch.cuda.is_available():
             for index in range(torch.cuda.device_count()):
                 with torch.cuda.device(index):
@@ -195,6 +279,7 @@ def _collect_resource_snapshot() -> dict[str, Any]:
                         "used": total_bytes - free_bytes,
                         "allocated": torch.cuda.memory_allocated(index),
                         "reserved": torch.cuda.memory_reserved(index),
+                        "utilization_percent": gpu_utilization.get(index),
                     })
     except Exception:
         logger.debug("Could not collect CUDA memory snapshot", exc_info=True)
@@ -323,6 +408,33 @@ def _build_segmentation_options(
     return options
 
 
+def _parse_prompt_layers(prompt: str, prompts_json: str | None = None) -> list[str]:
+    prompts = []
+    if prompts_json:
+        try:
+            parsed = json.loads(prompts_json)
+            if isinstance(parsed, list):
+                prompts.extend(str(item).strip() for item in parsed if str(item).strip())
+        except json.JSONDecodeError as exc:
+            raise HTTPException(status_code=400, detail=f"Invalid prompts_json: {exc}") from exc
+
+    if not prompts:
+        prompts.extend(line.strip() for line in prompt.splitlines() if line.strip())
+
+    if not prompts and prompt.strip():
+        prompts = [prompt.strip()]
+
+    deduped = []
+    seen = set()
+    for item in prompts:
+        key = item.lower()
+        if key in seen:
+            continue
+        deduped.append(item)
+        seen.add(key)
+    return deduped
+
+
 def _encode_png_base64(image: Image.Image) -> str:
     buffer = io.BytesIO()
     image.save(buffer, format="PNG")
@@ -365,6 +477,95 @@ def _save_mask_file(output_dir: Path, filename: str, mask: np.ndarray) -> str:
     return filename
 
 
+def _save_raw_mask_file(output_dir: Path, filename: str, mask: np.ndarray) -> str:
+    np.save(output_dir / filename, np.asarray(mask))
+    return filename
+
+
+def _file_name_from_url(url: str | None) -> str | None:
+    if not url or "/files/" not in url:
+        return None
+    return url.split("/files/", 1)[1]
+
+
+def _load_target_mask(output_dir: Path, target: dict[str, Any], options: dict[str, Any]) -> np.ndarray | None:
+    raw_file = target.get("raw_mask_file")
+    if raw_file:
+        raw_path = output_dir / raw_file
+        if raw_path.exists():
+            raw_mask = np.load(raw_path)
+            if raw_mask.dtype == bool:
+                return raw_mask.astype(np.uint8)
+            return (raw_mask > options["sam_mask_threshold"]).astype(np.uint8)
+
+    mask_file = _file_name_from_url(target.get("mask_url"))
+    if mask_file:
+        mask_path = output_dir / mask_file
+        if mask_path.exists():
+            return (np.array(Image.open(mask_path).convert("L")) > 0).astype(np.uint8)
+    return None
+
+
+def _postprocess_mask_array(mask: np.ndarray, options: dict[str, Any]) -> np.ndarray:
+    processed = (mask > 0).astype(np.uint8)
+    cleanup_px = int(options["mask_cleanup_px"])
+    if cleanup_px > 0:
+        kernel_size = cleanup_px if cleanup_px % 2 == 1 else cleanup_px + 1
+        kernel = np.ones((kernel_size, kernel_size), dtype=np.uint8)
+        processed = cv2.morphologyEx(processed, cv2.MORPH_OPEN, kernel)
+        processed = cv2.morphologyEx(processed, cv2.MORPH_CLOSE, kernel)
+
+    expand_px = int(options["mask_expand_px"])
+    if expand_px:
+        kernel_size = abs(expand_px) * 2 + 1
+        kernel = np.ones((kernel_size, kernel_size), dtype=np.uint8)
+        if expand_px > 0:
+            processed = cv2.dilate(processed, kernel, iterations=1)
+        else:
+            processed = cv2.erode(processed, kernel, iterations=1)
+
+    min_area = int(options["mask_min_area"])
+    if min_area > 0:
+        num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(
+            processed,
+            connectivity=8,
+        )
+        kept = np.zeros_like(processed)
+        for label in range(1, num_labels):
+            if stats[label, cv2.CC_STAT_AREA] >= min_area:
+                kept[labels == label] = 1
+        processed = kept
+    return processed.astype(np.uint8)
+
+
+def _resize_mask(mask: np.ndarray, width: int, height: int) -> np.ndarray:
+    if mask.shape != (height, width):
+        mask = cv2.resize(mask, (width, height), interpolation=cv2.INTER_NEAREST)
+    return (mask > 0).astype(np.uint8)
+
+
+def _create_visualization_image(image: Image.Image, mask: np.ndarray) -> Image.Image:
+    image_array = np.array(image.convert("RGB"))
+    height, width = image_array.shape[:2]
+    binary_mask = _resize_mask(mask, width, height)
+    mask_colored = np.zeros_like(image_array)
+    mask_colored[binary_mask > 0] = [42, 214, 255]
+    blended = (0.62 * image_array.astype(float) + 0.38 * mask_colored.astype(float)).astype(np.uint8)
+    contours, _ = cv2.findContours(binary_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if contours:
+        cv2.drawContours(blended, contours, -1, (0, 0, 0), 5)
+        cv2.drawContours(blended, contours, -1, (255, 255, 255), 2)
+    return Image.fromarray(blended)
+
+
+def _create_segmented_image(image: Image.Image, mask: np.ndarray) -> Image.Image:
+    image_array = np.array(image.convert("RGBA"))
+    height, width = image_array.shape[:2]
+    binary_mask = _resize_mask(mask, width, height)
+    image_array[..., 3] = (binary_mask * 255).astype(np.uint8)
+    return Image.fromarray(image_array)
+
+
 def _strip_base64(value: Any) -> Any:
     if isinstance(value, dict):
         return {
@@ -377,6 +578,81 @@ def _strip_base64(value: Any) -> Any:
     return value
 
 
+def _save_result_assets(
+    output_id: str,
+    output_dir: Path,
+    prefix: str,
+    results: dict[str, Any],
+    response_data: dict[str, Any],
+) -> None:
+    if "mask" in results:
+        filename = _save_mask_file(output_dir, f"{prefix}_mask.png", results["mask"])
+        response_data["mask_url"] = _output_file_url(output_id, filename)
+    if "visualization" in results:
+        filename = _save_image_file(output_dir, f"{prefix}_overlay.png", results["visualization"])
+        response_data["visualization_url"] = _output_file_url(output_id, filename)
+    if "segmented_image" in results:
+        filename = _save_image_file(
+            output_dir,
+            f"{prefix}_segmented.png",
+            results["segmented_image"],
+        )
+        response_data["segmented_image_url"] = _output_file_url(output_id, filename)
+
+    for index, (pass_result, pass_response) in enumerate(
+        zip(results.get("pass_outputs", []), response_data.get("pass_outputs", [])),
+        start=1,
+    ):
+        pass_prefix = f"{prefix}_pass_{index:02d}"
+        if "mask" in pass_result:
+            filename = _save_mask_file(output_dir, f"{pass_prefix}_mask.png", pass_result["mask"])
+            pass_response["mask_url"] = _output_file_url(output_id, filename)
+        if "visualization" in pass_result:
+            filename = _save_image_file(
+                output_dir,
+                f"{pass_prefix}_overlay.png",
+                pass_result["visualization"],
+            )
+            pass_response["visualization_url"] = _output_file_url(output_id, filename)
+        if "segmented_image" in pass_result:
+            filename = _save_image_file(
+                output_dir,
+                f"{pass_prefix}_segmented.png",
+                pass_result["segmented_image"],
+            )
+            pass_response["segmented_image_url"] = _output_file_url(output_id, filename)
+
+    for index, (target_result, target_response) in enumerate(
+        zip(results.get("target_outputs", []), response_data.get("target_outputs", [])),
+        start=1,
+    ):
+        target_prefix = f"{prefix}_target_{index:03d}"
+        if "mask" in target_result:
+            filename = _save_mask_file(output_dir, f"{target_prefix}_mask.png", target_result["mask"])
+            target_response["mask_url"] = _output_file_url(output_id, filename)
+        if "raw_mask" in target_result:
+            filename = _save_raw_mask_file(
+                output_dir,
+                f"{target_prefix}_raw.npy",
+                target_result["raw_mask"],
+            )
+            target_response["raw_mask_file"] = filename
+        if "visualization" in target_result:
+            filename = _save_image_file(
+                output_dir,
+                f"{target_prefix}_overlay.png",
+                target_result["visualization"],
+            )
+            target_response["visualization_url"] = _output_file_url(output_id, filename)
+        if "segmented_image" in target_result:
+            filename = _save_image_file(
+                output_dir,
+                f"{target_prefix}_segmented.png",
+                target_result["segmented_image"],
+            )
+            target_response["segmented_image_url"] = _output_file_url(output_id, filename)
+
+
 def _save_segmentation_outputs(
     output_id: str,
     source_filename: str | None,
@@ -384,6 +660,7 @@ def _save_segmentation_outputs(
     source_image: Image.Image,
     results: dict[str, Any],
     response_data: dict[str, Any],
+    metadata_extra: dict[str, Any] | None = None,
 ) -> None:
     output_dir = _output_root() / output_id
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -394,73 +671,31 @@ def _save_segmentation_outputs(
     original_name = _save_image_file(output_dir, "original.png", source_image.convert("RGB"))
     response_data["original_image_url"] = _output_file_url(output_id, original_name)
 
-    if "mask" in results:
-        filename = _save_mask_file(output_dir, "final_mask.png", results["mask"])
-        response_data["mask_url"] = _output_file_url(output_id, filename)
-    if "visualization" in results:
-        filename = _save_image_file(output_dir, "final_overlay.png", results["visualization"])
-        response_data["visualization_url"] = _output_file_url(output_id, filename)
-    if "segmented_image" in results:
-        filename = _save_image_file(
+    _save_result_assets(output_id, output_dir, "final", results, response_data)
+    for layer_result, layer_response in zip(
+        results.get("layers", []),
+        response_data.get("layers", []),
+    ):
+        layer_number = int(layer_result.get("layer_number") or layer_response.get("layer_number") or 0)
+        _save_result_assets(
+            output_id,
             output_dir,
-            "final_segmented.png",
-            results["segmented_image"],
+            f"layer_{layer_number:02d}",
+            layer_result,
+            layer_response,
         )
-        response_data["segmented_image_url"] = _output_file_url(output_id, filename)
-
-    for index, (pass_result, pass_response) in enumerate(
-        zip(results.get("pass_outputs", []), response_data.get("pass_outputs", [])),
-        start=1,
-    ):
-        prefix = f"pass_{index:02d}"
-        if "mask" in pass_result:
-            filename = _save_mask_file(output_dir, f"{prefix}_mask.png", pass_result["mask"])
-            pass_response["mask_url"] = _output_file_url(output_id, filename)
-        if "visualization" in pass_result:
-            filename = _save_image_file(
-                output_dir,
-                f"{prefix}_overlay.png",
-                pass_result["visualization"],
-            )
-            pass_response["visualization_url"] = _output_file_url(output_id, filename)
-        if "segmented_image" in pass_result:
-            filename = _save_image_file(
-                output_dir,
-                f"{prefix}_segmented.png",
-                pass_result["segmented_image"],
-            )
-            pass_response["segmented_image_url"] = _output_file_url(output_id, filename)
-
-    for index, (target_result, target_response) in enumerate(
-        zip(results.get("target_outputs", []), response_data.get("target_outputs", [])),
-        start=1,
-    ):
-        prefix = f"target_{index:03d}"
-        if "mask" in target_result:
-            filename = _save_mask_file(output_dir, f"{prefix}_mask.png", target_result["mask"])
-            target_response["mask_url"] = _output_file_url(output_id, filename)
-        if "visualization" in target_result:
-            filename = _save_image_file(
-                output_dir,
-                f"{prefix}_overlay.png",
-                target_result["visualization"],
-            )
-            target_response["visualization_url"] = _output_file_url(output_id, filename)
-        if "segmented_image" in target_result:
-            filename = _save_image_file(
-                output_dir,
-                f"{prefix}_segmented.png",
-                target_result["segmented_image"],
-            )
-            target_response["segmented_image_url"] = _output_file_url(output_id, filename)
 
     metadata = {
         "id": output_id,
         "filename": source_filename,
         "prompt": prompt,
+        "prompts": results.get("prompts") or [prompt],
+        "segmentation_generation": 1,
         "created_at": _now(),
         "result": _strip_base64(response_data),
     }
+    if metadata_extra:
+        metadata.update(metadata_extra)
     with open(output_dir / "metadata.json", "w", encoding="utf-8") as metadata_file:
         json.dump(metadata, metadata_file, indent=2)
 
@@ -540,7 +775,109 @@ def _build_segment_response(results: dict[str, Any], prompt: str) -> dict[str, A
     if target_outputs:
         response_data["target_outputs"] = target_outputs
 
+    layers = []
+    for layer_result in results.get("layers", []):
+        layer_response = _build_segment_response(
+            layer_result,
+            layer_result.get("prompt") or "",
+        )
+        layer_response["layer_number"] = layer_result.get("layer_number")
+        layer_response["layer_prompt"] = layer_result.get("layer_prompt")
+        layers.append(layer_response)
+
+    if layers:
+        response_data["layers"] = layers
+
     return response_data
+
+
+def _build_layered_results(
+    engine: Any,
+    image: Image.Image,
+    prompts: list[str],
+    options: dict[str, Any],
+    progress_callback,
+) -> dict[str, Any]:
+    layer_results = []
+    combined_mask = None
+    all_targets = []
+    all_prompts = []
+    model_outputs = []
+    processed_image = None
+
+    for index, layer_prompt in enumerate(prompts):
+        layer_start = int((index / len(prompts)) * 100)
+        layer_end = int(((index + 1) / len(prompts)) * 100)
+
+        def layer_progress(progress: int, message: str, *, start=layer_start, end=layer_end) -> None:
+            scaled = start + int((max(0, min(100, progress)) / 100) * (end - start))
+            progress_callback(scaled, f"Layer {index + 1}/{len(prompts)}: {message}")
+
+        result = engine.segment(
+            image,
+            layer_prompt,
+            return_visualization=True,
+            progress_callback=layer_progress,
+            options=options,
+        )
+        if not result.get("success"):
+            raise RuntimeError(
+                f"Layer '{layer_prompt}' failed: {result.get('error') or 'unknown error'}"
+            )
+
+        layer_number = index + 1
+        target_offset = len(all_targets)
+        result["layer_number"] = layer_number
+        result["layer_prompt"] = layer_prompt
+        for target in result.get("target_outputs", []):
+            target["layer_number"] = layer_number
+            target["layer_prompt"] = layer_prompt
+            target["target_number"] = target_offset + int(target.get("target_number") or 0)
+            all_targets.append(target)
+
+        for pass_output in result.get("pass_outputs", []):
+            pass_output["layer_number"] = layer_number
+            pass_output["layer_prompt"] = layer_prompt
+            pass_output["target_numbers"] = [
+                target_offset + int(number)
+                for number in pass_output.get("target_numbers", [])
+            ]
+
+        layer_results.append(result)
+        all_prompts.extend(result.get("sam_prompts") or [])
+        if result.get("model_output"):
+            model_outputs.append(result["model_output"])
+        processed_image = processed_image or engine.preprocess_image(image)
+        layer_mask = np.asarray(result["mask"]).astype(np.uint8)
+        combined_mask = (
+            layer_mask
+            if combined_mask is None
+            else np.logical_or(combined_mask > 0, layer_mask > 0).astype(np.uint8)
+        )
+
+    if combined_mask is None:
+        combined_mask = np.zeros(processed_image.size[::-1], dtype=np.uint8)
+
+    return {
+        "success": True,
+        "prompt": " | ".join(prompts),
+        "prompts": prompts,
+        "mask": combined_mask,
+        "original_size": processed_image.size,
+        "uploaded_size": image.size,
+        "sam_prompts": all_prompts,
+        "model_output": "\n\n".join(model_outputs),
+        "model_outputs": model_outputs,
+        "options": options,
+        "refinement_passes_completed": max(
+            (layer.get("refinement_passes_completed") or 1 for layer in layer_results),
+            default=1,
+        ),
+        "target_outputs": all_targets,
+        "layers": layer_results,
+        "visualization": engine._create_visualization(processed_image, combined_mask),
+        "segmented_image": engine._create_segmented_image(processed_image, combined_mask),
+    }
 
 
 def _run_segment_job(
@@ -549,6 +886,8 @@ def _run_segment_job(
     prompt: str,
     options: dict[str, Any],
     filename: str | None = None,
+    prompts: list[str] | None = None,
+    metadata_extra: dict[str, Any] | None = None,
 ) -> None:
     _update_job(
         job_id,
@@ -604,13 +943,23 @@ def _run_segment_job(
             )
             progress_callback(45, "Models ready")
 
-            results = engine.segment(
-                image,
-                prompt,
-                return_visualization=True,
-                progress_callback=scaled_progress(45, 98),
-                options=options,
-            )
+            layer_prompts = prompts or [prompt]
+            if len(layer_prompts) > 1:
+                results = _build_layered_results(
+                    engine,
+                    image,
+                    layer_prompts,
+                    options,
+                    progress_callback=scaled_progress(45, 98),
+                )
+            else:
+                results = engine.segment(
+                    image,
+                    layer_prompts[0],
+                    return_visualization=True,
+                    progress_callback=scaled_progress(45, 98),
+                    options=options,
+                )
             if not results["success"]:
                 raise RuntimeError(results.get("error") or "Segmentation failed")
 
@@ -630,6 +979,7 @@ def _run_segment_job(
                 image,
                 results,
                 response_data,
+                metadata_extra=metadata_extra,
             )
             _update_job(
                 job_id,
@@ -881,6 +1231,43 @@ async def get_status():
     return get_inference_status()
 
 
+@app.get("/runtime-settings")
+async def get_runtime_settings():
+    """Return resource allocation settings used for the next model load."""
+    status = get_inference_status()
+    return {
+        "model_loaded": status["loaded"],
+        "model_gpu_memory_utilization": settings.model_gpu_memory_utilization,
+        "model_max_memory_gb": settings.model_max_memory_gb,
+        "applies_to_loaded_model": not status["loaded"],
+    }
+
+
+@app.post("/runtime-settings")
+async def update_runtime_settings(request: RuntimeSettingsRequest):
+    """Update resource allocation settings for future model loads."""
+    if request.model_gpu_memory_utilization is not None:
+        settings.model_gpu_memory_utilization = min(
+            max(float(request.model_gpu_memory_utilization), 0.1),
+            0.99,
+        )
+    if request.model_max_memory_gb is not None:
+        value = float(request.model_max_memory_gb)
+        settings.model_max_memory_gb = value if value > 0 else None
+
+    status = get_inference_status()
+    return {
+        "model_loaded": status["loaded"],
+        "model_gpu_memory_utilization": settings.model_gpu_memory_utilization,
+        "model_max_memory_gb": settings.model_max_memory_gb,
+        "message": (
+            "Settings will apply on the next model load"
+            if status["loaded"]
+            else "Settings will apply to the first model load"
+        ),
+    }
+
+
 @app.get("/outputs")
 async def list_outputs():
     """List saved segmentation output folders."""
@@ -894,6 +1281,10 @@ async def list_outputs():
                 "id": metadata.get("id") or metadata_path.parent.name,
                 "filename": metadata.get("filename"),
                 "prompt": metadata.get("prompt"),
+                "prompts": metadata.get("prompts"),
+                "segmentation_generation": metadata.get("segmentation_generation", 1),
+                "root_output_id": metadata.get("root_output_id"),
+                "parent_output_id": metadata.get("parent_output_id"),
                 "created_at": metadata.get("created_at"),
                 "original_image_url": result.get("original_image_url"),
                 "visualization_url": result.get("visualization_url"),
@@ -930,10 +1321,164 @@ async def get_output_file(output_id: str, filename: str):
     return FileResponse(file_path)
 
 
+@app.post("/outputs/{output_id}/postprocess")
+async def postprocess_output(output_id: str, request: PostprocessRequest):
+    """Recompose saved target masks with new post-processing settings."""
+    output_dir = _safe_output_dir(output_id)
+    metadata_path = output_dir / "metadata.json"
+    if not metadata_path.exists():
+        raise HTTPException(status_code=404, detail="Saved output not found")
+    with open(metadata_path, "r", encoding="utf-8") as metadata_file:
+        metadata = json.load(metadata_file)
+    result = metadata.get("result") or {}
+    options = dict(DEFAULT_SEGMENTATION_OPTIONS)
+    options.update(result.get("options") or {})
+    options.update(request.options or {})
+    options = _build_segmentation_options(
+        options["sam_mask_threshold"],
+        options["sam_multimask_output"],
+        options["mask_min_area"],
+        options["mask_cleanup_px"],
+        options["mask_expand_px"],
+        options["refinement_passes"],
+        options["refinement_mode"],
+    )
+
+    targets = result.get("target_outputs") or []
+    if request.layer_number is not None:
+        targets = [
+            target
+            for target in targets
+            if int(target.get("layer_number") or 0) == int(request.layer_number)
+        ]
+    if request.selected_target_numbers is not None:
+        selected = {int(number) for number in request.selected_target_numbers}
+        targets = [
+            target
+            for target in targets
+            if int(target.get("target_number") or 0) in selected
+        ]
+
+    combined_mask = None
+    target_responses = []
+    original = Image.open(output_dir / "original.png").convert("RGB")
+    for target in targets:
+        mask = _load_target_mask(output_dir, target, options)
+        if mask is None:
+            continue
+        mask = _postprocess_mask_array(mask, options)
+        combined_mask = mask if combined_mask is None else np.logical_or(combined_mask > 0, mask > 0).astype(np.uint8)
+        target_response = dict(target)
+        target_response["mask_base64"] = _mask_to_png_base64(mask)
+        target_response["visualization_base64"] = _encode_png_base64(
+            _create_visualization_image(original, mask),
+        )
+        target_response["segmented_image_base64"] = _encode_png_base64(
+            _create_segmented_image(original, mask),
+        )
+        target_responses.append(target_response)
+
+    if combined_mask is None:
+        combined_mask = np.zeros((original.height, original.width), dtype=np.uint8)
+    combined_mask = _postprocess_mask_array(combined_mask, options)
+    return {
+        "success": True,
+        "output_id": output_id,
+        "options": options,
+        "selected_target_numbers": request.selected_target_numbers,
+        "mask_base64": _mask_to_png_base64(combined_mask),
+        "visualization_base64": _encode_png_base64(
+            _create_visualization_image(original, combined_mask),
+        ),
+        "segmented_image_base64": _encode_png_base64(
+            _create_segmented_image(original, combined_mask),
+        ),
+        "target_outputs": target_responses,
+    }
+
+
+@app.post("/outputs/{output_id}/refine/jobs")
+async def refine_output_job(
+    output_id: str,
+    request: RefineOutputRequest,
+    background_tasks: BackgroundTasks,
+):
+    """Create a segmentation job from a saved segmented output."""
+    output_dir = _safe_output_dir(output_id)
+    metadata_path = output_dir / "metadata.json"
+    if not metadata_path.exists():
+        raise HTTPException(status_code=404, detail="Saved output not found")
+    with open(metadata_path, "r", encoding="utf-8") as metadata_file:
+        metadata = json.load(metadata_file)
+    result = metadata.get("result") or {}
+    image_name = _file_name_from_url(result.get("segmented_image_url")) or "final_segmented.png"
+    image_path = output_dir / image_name
+    if not image_path.exists():
+        image_path = output_dir / "original.png"
+    prompts = [prompt.strip() for prompt in (request.prompts or metadata.get("prompts") or [metadata.get("prompt")]) if str(prompt).strip()]
+    if not prompts:
+        raise HTTPException(status_code=400, detail="No prompts available for refinement")
+    base_options = dict(DEFAULT_SEGMENTATION_OPTIONS)
+    base_options.update(result.get("options") or {})
+    base_options.update(request.options or {})
+    options = _build_segmentation_options(
+        base_options["sam_mask_threshold"],
+        base_options["sam_multimask_output"],
+        base_options["mask_min_area"],
+        base_options["mask_cleanup_px"],
+        base_options["mask_expand_px"],
+        0,
+        base_options["refinement_mode"],
+    )
+    job_id = uuid.uuid4().hex
+    image_data = image_path.read_bytes()
+    clean_prompt = " | ".join(prompts)
+    generation = int(metadata.get("segmentation_generation") or 1) + 1
+    job = {
+        "id": job_id,
+        "filename": f"refine-{metadata.get('filename') or output_id}.png",
+        "prompt": clean_prompt,
+        "prompts": prompts,
+        "options": options,
+        "status": "queued",
+        "progress": 0,
+        "stage": "Queued",
+        "message": "Waiting to refine saved output",
+        "error": None,
+        "result": None,
+        "resource_snapshot": None,
+        "resource_log": [],
+        "created_at": _now(),
+        "started_at": None,
+        "completed_at": None,
+        "updated_at": _now(),
+    }
+    with SEGMENTATION_JOBS_LOCK:
+        SEGMENTATION_JOBS[job_id] = job
+    _prune_jobs()
+    metadata_extra = {
+        "parent_output_id": output_id,
+        "root_output_id": metadata.get("root_output_id") or output_id,
+        "segmentation_generation": generation,
+    }
+    background_tasks.add_task(
+        _run_segment_job,
+        job_id,
+        image_data,
+        clean_prompt,
+        options,
+        job["filename"],
+        prompts,
+        metadata_extra,
+    )
+    return JSONResponse(_serialize_job(job))
+
+
 @app.post("/segment")
 async def segment_image(
     file: UploadFile = File(...),
     prompt: str = Form(...),
+    prompts_json: str | None = Form(None),
     sam_mask_threshold: float = Form(DEFAULT_SEGMENTATION_OPTIONS["sam_mask_threshold"]),
     sam_multimask_output: bool = Form(DEFAULT_SEGMENTATION_OPTIONS["sam_multimask_output"]),
     mask_min_area: int = Form(DEFAULT_SEGMENTATION_OPTIONS["mask_min_area"]),
@@ -974,6 +1519,9 @@ async def segment_image(
 
         # Get inference engine
         engine = get_inference_engine()
+        prompts = _parse_prompt_layers(prompt, prompts_json)
+        if not prompts:
+            raise HTTPException(status_code=400, detail="Prompt is required")
         options = _build_segmentation_options(
             sam_mask_threshold,
             sam_multimask_output,
@@ -985,21 +1533,31 @@ async def segment_image(
         )
 
         # Run segmentation
-        results = engine.segment(
-            image,
-            prompt,
-            return_visualization=True,
-            options=options,
-        )
+        if len(prompts) > 1:
+            results = _build_layered_results(
+                engine,
+                image,
+                prompts,
+                options,
+                progress_callback=lambda _progress, _message: None,
+            )
+        else:
+            results = engine.segment(
+                image,
+                prompts[0],
+                return_visualization=True,
+                options=options,
+            )
 
         if not results["success"]:
             raise HTTPException(status_code=500, detail=results.get("error"))
 
-        response_data = _build_segment_response(results, prompt)
+        display_prompt = " | ".join(prompts)
+        response_data = _build_segment_response(results, display_prompt)
         _save_segmentation_outputs(
             uuid.uuid4().hex,
             file.filename,
-            prompt,
+            display_prompt,
             image,
             results,
             response_data,
@@ -1018,6 +1576,7 @@ async def create_segment_job(
     background_tasks: BackgroundTasks,
     file: UploadFile = File(...),
     prompt: str = Form(...),
+    prompts_json: str | None = Form(None),
     sam_mask_threshold: float = Form(DEFAULT_SEGMENTATION_OPTIONS["sam_mask_threshold"]),
     sam_multimask_output: bool = Form(DEFAULT_SEGMENTATION_OPTIONS["sam_multimask_output"]),
     mask_min_area: int = Form(DEFAULT_SEGMENTATION_OPTIONS["mask_min_area"]),
@@ -1031,9 +1590,10 @@ async def create_segment_job(
     if not content_type.startswith("image/"):
         raise HTTPException(status_code=400, detail="File must be an image")
 
-    clean_prompt = prompt.strip()
-    if not clean_prompt:
+    prompts = _parse_prompt_layers(prompt, prompts_json)
+    if not prompts:
         raise HTTPException(status_code=400, detail="Prompt is required")
+    clean_prompt = " | ".join(prompts)
 
     image_data = await file.read()
     if not image_data:
@@ -1053,6 +1613,7 @@ async def create_segment_job(
         "id": job_id,
         "filename": file.filename,
         "prompt": clean_prompt,
+        "prompts": prompts,
         "options": options,
         "status": "queued",
         "progress": 0,
@@ -1076,6 +1637,7 @@ async def create_segment_job(
         clean_prompt,
         options,
         file.filename,
+        prompts,
     )
     return JSONResponse(_serialize_job(job))
 

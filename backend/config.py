@@ -1,4 +1,4 @@
-from pydantic import ConfigDict, Field
+from pydantic import ConfigDict, Field, field_validator
 from pydantic_settings import BaseSettings
 from typing import Optional
 
@@ -31,6 +31,8 @@ class Settings(BaseSettings):
     )
     device: str = "cuda"  # or "cpu"
     model_device_map: str = "auto"  # auto shards the VLM across visible GPUs
+    model_gpu_memory_utilization: float = 0.95
+    model_max_memory_gb: Optional[float] = None
     dtype: str = "bfloat16"  # or "float32"
 
     # SAM2 Configuration
@@ -63,6 +65,14 @@ class Settings(BaseSettings):
     # VLLM Configuration (for faster inference)
     use_vllm: bool = False
     vllm_tensor_parallel_size: int = 1
+
+    @field_validator("model_max_memory_gb", mode="before")
+    @classmethod
+    def _parse_optional_memory_cap(cls, value):
+        if value in (None, ""):
+            return None
+        numeric_value = float(value)
+        return numeric_value if numeric_value > 0 else None
 
     def model_post_init(self, __context):
         """Post-initialization validation."""

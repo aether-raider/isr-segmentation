@@ -83,6 +83,9 @@ class Think2SegInference:
                 "trust_remote_code": True,
                 "cache_dir": settings.cache_dir,
             }
+            max_memory = self._get_model_max_memory(model_device_map)
+            if max_memory:
+                model_kwargs["max_memory"] = max_memory
             if settings.hf_token:
                 tokenizer_kwargs["token"] = settings.hf_token
                 model_kwargs["token"] = settings.hf_token
@@ -153,6 +156,38 @@ class Think2SegInference:
                 torch.set_float32_matmul_precision("high")
             except Exception:
                 logger.debug("Could not set float32 matmul precision", exc_info=True)
+
+    def _get_model_max_memory(self, model_device_map) -> Optional[dict]:
+        """Let Accelerate use a configurable share of currently free GPU memory."""
+        if (
+            not model_device_map
+            or not self.device.startswith("cuda")
+            or not torch.cuda.is_available()
+        ):
+            return None
+
+        utilization = min(
+            max(float(settings.model_gpu_memory_utilization or 0.95), 0.1),
+            0.99,
+        )
+        explicit_gb = settings.model_max_memory_gb
+        max_memory = {}
+        for index in range(torch.cuda.device_count()):
+            try:
+                free_bytes, _ = torch.cuda.mem_get_info(index)
+                budget_bytes = int(free_bytes * utilization)
+                if explicit_gb:
+                    budget_bytes = min(
+                        budget_bytes,
+                        int(float(explicit_gb) * 1024**3),
+                    )
+                max_memory[index] = f"{max(1, budget_bytes // 1024**2)}MiB"
+            except Exception:
+                logger.debug("Could not calculate max memory for GPU %s", index, exc_info=True)
+
+        if max_memory:
+            logger.info("Model max_memory map: %s", max_memory)
+        return max_memory or None
 
     def _get_input_device(self) -> torch.device:
         """Return the device where request tensors should enter the model."""
@@ -764,6 +799,7 @@ class Think2SegInference:
                     "target_in_pass": index + 1,
                     "score": score,
                     "sam_prompt": instance,
+                    "raw_mask": raw_mask.astype(np.float32, copy=False),
                     "mask": instance_mask.astype(np.uint8),
                 })
                 combined_mask = (
@@ -997,6 +1033,8 @@ class Think2SegInference:
             "gpu_count": gpu_count,
             "gpu_names": gpu_names,
             "model_device_map": settings.model_device_map,
+            "model_gpu_memory_utilization": settings.model_gpu_memory_utilization,
+            "model_max_memory_gb": settings.model_max_memory_gb,
             "hf_device_map": hf_device_map,
             "sam2_device": settings.sam2_device,
             "clear_cuda_cache_after_run": settings.clear_cuda_cache_after_run,
@@ -1036,6 +1074,8 @@ def get_inference_status() -> dict:
         "gpu_count": gpu_count,
         "gpu_names": gpu_names,
         "model_device_map": settings.model_device_map,
+        "model_gpu_memory_utilization": settings.model_gpu_memory_utilization,
+        "model_max_memory_gb": settings.model_max_memory_gb,
         "hf_device_map": None,
         "sam2_device": settings.sam2_device,
         "clear_cuda_cache_after_run": settings.clear_cuda_cache_after_run,

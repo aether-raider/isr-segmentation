@@ -84,23 +84,26 @@
             </div>
 
             <label v-if="runMode === 'prompt'" class="mt-4 block text-sm font-semibold text-slate-800" for="prompt">
-              Segmentation Prompt
+              Layer Prompts
             </label>
             <textarea
               v-if="runMode === 'prompt'"
               id="prompt"
               v-model="prompt"
               rows="4"
-              placeholder="water bodies, roads, buildings, forest coverage..."
+              placeholder="buildings&#10;trees&#10;water bodies&#10;shopping mall, basketball court and residential buildings"
               class="mt-3 w-full resize-none rounded-lg border border-slate-300 bg-white p-3 text-sm focus:border-cyan-600 focus:outline-none focus:ring-2 focus:ring-cyan-100"
             ></textarea>
+            <p v-if="runMode === 'prompt'" class="mt-2 text-xs leading-5 text-slate-500">
+              Enter one layer per line. A line can still describe multiple objects that should belong to the same layer.
+            </p>
             <div v-if="runMode === 'prompt'" class="mt-3 flex flex-wrap gap-2">
               <button
                 v-for="suggestion in suggestedPrompts"
                 :key="suggestion"
                 type="button"
                 class="rounded-full border border-slate-300 bg-white px-3 py-1 text-xs text-slate-700 transition hover:border-cyan-500 hover:text-cyan-700"
-                @click="prompt = suggestion"
+                @click="appendPromptLayer(suggestion)"
               >
                 {{ suggestion }}
               </button>
@@ -254,6 +257,51 @@
                     </span>
                   </span>
                 </label>
+
+                <div class="rounded-lg border border-slate-200 bg-slate-50 p-3">
+                  <div class="flex items-center justify-between gap-3">
+                    <div>
+                      <p class="text-sm font-semibold text-slate-800">GPU Memory Target</p>
+                      <p class="text-xs leading-5 text-slate-500">
+                        Uses this share of currently free VRAM when the Think2Seg model is loaded.
+                      </p>
+                    </div>
+                    <span class="rounded-md bg-white px-2 py-1 text-xs font-semibold text-slate-700">
+                      {{ Math.round(runtimeSettings.modelGpuMemoryUtilization * 100) }}%
+                    </span>
+                  </div>
+                  <input
+                    v-model.number="runtimeSettings.modelGpuMemoryUtilization"
+                    type="range"
+                    min="0.5"
+                    max="0.99"
+                    step="0.01"
+                    class="mt-3 w-full accent-cyan-700"
+                  />
+                  <label class="mt-3 block">
+                    <span class="text-xs font-semibold text-slate-700">Optional hard cap per GPU in GB</span>
+                    <input
+                      v-model.number="runtimeSettings.modelMaxMemoryGb"
+                      type="number"
+                      min="0"
+                      step="1"
+                      placeholder="0 = no hard cap"
+                      class="mt-1 w-full rounded-lg border border-slate-300 bg-white p-2 text-sm focus:border-cyan-600 focus:outline-none focus:ring-2 focus:ring-cyan-100"
+                    />
+                  </label>
+                  <div class="mt-3 flex items-center justify-between gap-3">
+                    <p class="text-xs text-slate-500">
+                      {{ runtimeSettings.message || (runtimeSettings.modelLoaded ? 'Model is loaded; changes apply next load.' : 'Applies before the first model load.') }}
+                    </p>
+                    <button
+                      type="button"
+                      class="rounded-md bg-cyan-700 px-3 py-1.5 text-xs font-semibold text-white transition hover:bg-cyan-800"
+                      @click="applyRuntimeSettings"
+                    >
+                      Apply
+                    </button>
+                  </div>
+                </div>
               </div>
             </div>
 
@@ -454,6 +502,51 @@
             </div>
 
             <div
+              v-if="selectedView === 'layers' && layerOutputs(selectedJob).length"
+              class="mb-4 rounded-lg border border-slate-200 bg-slate-50 p-3"
+            >
+              <div class="flex items-center justify-between gap-3">
+                <div>
+                  <p class="text-sm font-semibold text-slate-800">Prompt Layers</p>
+                  <p class="text-xs text-slate-500">Each line from the prompt box is preserved as its own layer.</p>
+                </div>
+                <span class="rounded-md bg-white px-2 py-1 text-xs font-semibold text-slate-600">
+                  {{ selectedLayerIndex + 1 }} of {{ layerOutputs(selectedJob).length }}
+                </span>
+              </div>
+              <div class="mt-3 grid grid-cols-2 gap-3 sm:grid-cols-4">
+                <button
+                  v-for="(layerOutput, index) in layerOutputs(selectedJob)"
+                  :key="`layer-${layerOutput.layer_number || index}`"
+                  type="button"
+                  :class="[
+                    'overflow-hidden rounded-lg border bg-white text-left transition hover:border-cyan-600',
+                    selectedLayerIndex === index ? 'border-cyan-700 ring-2 ring-cyan-100' : 'border-slate-200'
+                  ]"
+                  @click="selectedLayerIndex = index"
+                >
+                  <img
+                    v-if="layerSegmentedImage(layerOutput)"
+                    :src="layerSegmentedImage(layerOutput)"
+                    alt=""
+                    class="h-20 w-full bg-slate-950 object-contain"
+                  />
+                  <div v-else class="flex h-20 items-center justify-center bg-slate-100 text-xs text-slate-500">
+                    No image
+                  </div>
+                  <div class="p-2">
+                    <p class="text-xs font-semibold text-slate-800">
+                      Layer {{ layerOutput.layer_number || index + 1 }}
+                    </p>
+                    <p class="mt-0.5 truncate text-[11px] text-slate-500">
+                      {{ layerOutput.layer_prompt || layerOutput.prompt }}
+                    </p>
+                  </div>
+                </button>
+              </div>
+            </div>
+
+            <div
               v-if="selectedView === 'targets' && targetOutputs(selectedJob).length"
               class="mb-4 rounded-lg border border-slate-200 bg-slate-50 p-3"
             >
@@ -608,7 +701,7 @@
               <div class="flex items-center justify-between border-b border-slate-800 px-4 py-3">
                 <div>
                   <p class="text-sm font-semibold">Resource Usage</p>
-                  <p class="text-xs text-slate-400">RAM and VRAM usage while the job runs</p>
+                  <p class="text-xs text-slate-400">CPU, RAM, GPU, and VRAM usage while the job runs</p>
                 </div>
                 <span class="rounded-full bg-slate-800 px-2 py-1 text-xs text-slate-300">
                   {{ latestResourceLog(selectedJob).length }} samples
@@ -666,6 +759,14 @@
                 @click="downloadJob(selectedJob)"
               >
                 Download Current View
+              </button>
+              <button
+                type="button"
+                class="rounded-lg border border-cyan-200 bg-cyan-50 px-4 py-2 text-sm font-semibold text-cyan-800 transition hover:bg-cyan-100 disabled:cursor-not-allowed disabled:opacity-50"
+                :disabled="!selectedJob.result?.output_id || isQueueRunning"
+                @click="refineSavedOutput(selectedJob)"
+              >
+                Refine This Output
               </button>
               <button
                 v-if="selectedJob.status === 'failed'"
@@ -775,7 +876,7 @@
 </template>
 
 <script>
-import { computed, onMounted, onUnmounted, ref } from 'vue'
+import { computed, onMounted, onUnmounted, ref, watch } from 'vue'
 import axios from 'axios'
 
 const MAX_FILE_SIZE = 25 * 1024 * 1024
@@ -785,6 +886,7 @@ const resultViews = [
   { id: 'overlay', label: 'Mask Overlay' },
   { id: 'mask', label: 'Mask Only' },
   { id: 'segmented', label: 'Segmented Image' },
+  { id: 'layers', label: 'Prompt Layers' },
   { id: 'targets', label: 'Target Masks' },
   { id: 'passes', label: 'Pass Outputs' }
 ]
@@ -818,6 +920,7 @@ export default {
     const selectedView = ref('before')
     const selectedPassIndex = ref(0)
     const selectedTargetIndex = ref(0)
+    const selectedLayerIndex = ref(0)
     const currentJobId = ref(null)
     const isQueueRunning = ref(false)
     const isDragging = ref(false)
@@ -829,6 +932,13 @@ export default {
     const outputHistory = ref([])
     const historyLoading = ref(false)
     const segmentationSettings = ref({ ...defaultSegmentationSettings })
+    const runtimeSettings = ref({
+      modelGpuMemoryUtilization: 0.95,
+      modelMaxMemoryGb: 0,
+      modelLoaded: false,
+      message: ''
+    })
+    let postprocessTimer = null
     let nextLocalId = 1
     let elapsedTimer = null
 
@@ -855,6 +965,7 @@ export default {
         overlay: 'Image with segmentation mask overlay',
         mask: 'Segmentation mask only',
         segmented: 'Segmented image cutout',
+        layers: 'Segmented image from the selected prompt layer',
         targets: 'Segmented image from the selected target mask',
         passes: 'Segmented image from the selected refinement pass'
       }
@@ -906,6 +1017,35 @@ export default {
       }
     }
 
+    const loadRuntimeSettings = async () => {
+      try {
+        const response = await axios.get('/api/runtime-settings')
+        runtimeSettings.value = {
+          modelGpuMemoryUtilization: Number(response.data.model_gpu_memory_utilization ?? 0.95),
+          modelMaxMemoryGb: Number(response.data.model_max_memory_gb || 0),
+          modelLoaded: Boolean(response.data.model_loaded),
+          message: response.data.applies_to_loaded_model === false
+            ? 'Model is loaded; changes apply next load.'
+            : 'Applies before the first model load.'
+        }
+      } catch (err) {
+        runtimeSettings.value.message = `Could not load runtime settings: ${getErrorMessage(err)}`
+      }
+    }
+
+    const applyRuntimeSettings = async () => {
+      try {
+        const response = await axios.post('/api/runtime-settings', {
+          model_gpu_memory_utilization: runtimeSettings.value.modelGpuMemoryUtilization,
+          model_max_memory_gb: Number(runtimeSettings.value.modelMaxMemoryGb || 0)
+        })
+        runtimeSettings.value.modelLoaded = Boolean(response.data.model_loaded)
+        runtimeSettings.value.message = response.data.message || 'Runtime settings updated.'
+      } catch (err) {
+        runtimeSettings.value.message = `Could not apply settings: ${getErrorMessage(err)}`
+      }
+    }
+
     const loadOutputHistory = async () => {
       historyLoading.value = true
       try {
@@ -939,6 +1079,7 @@ export default {
         previewAvailable: Boolean(result.original_image_url || output.original_image_url),
         dimensions: Array.isArray(result.original_size) ? `${result.original_size[0]} x ${result.original_size[1]}px` : 'Saved output',
         prompt: output.prompt || result.prompt || '',
+        prompts: output.prompts || result.prompts || [output.prompt || result.prompt || ''].filter(Boolean),
         cropId: '',
         jobType: 'prompt',
         status: 'succeeded',
@@ -955,6 +1096,8 @@ export default {
         settings: optionsToSegmentationSettings(result.options),
         selectedTargetNumbers: targetNumbers,
         result,
+        adjustedResult: null,
+        segmentationGeneration: output.segmentation_generation || 1,
         error: null,
         isSavedOutput: true
       }
@@ -963,6 +1106,21 @@ export default {
       selectedTargetIndex.value = 0
       selectedPassIndex.value = 0
       selectedView.value = targetNumbers.length ? 'targets' : 'segmented'
+    }
+
+    const parseLayerPrompts = (value) => {
+      return String(value || '')
+        .split(/\r?\n/)
+        .map((item) => item.trim())
+        .filter(Boolean)
+    }
+
+    const appendPromptLayer = (value) => {
+      const layers = parseLayerPrompts(prompt.value)
+      if (!layers.some((item) => item.toLowerCase() === value.toLowerCase())) {
+        layers.push(value)
+      }
+      prompt.value = layers.join('\n')
     }
 
     const handleFileSelect = (event) => {
@@ -1013,6 +1171,7 @@ export default {
         previewAvailable: true,
         dimensions: 'Reading image',
         prompt: '',
+        prompts: [],
         cropId: '',
         jobType: 'prompt',
         status: 'queued',
@@ -1028,6 +1187,7 @@ export default {
         resourceSnapshot: null,
         settings: null,
         selectedTargetNumbers: [],
+        adjustedResult: null,
         result: null,
         error: null
       }
@@ -1100,12 +1260,13 @@ export default {
     const startQueue = async () => {
       if (isQueueRunning.value) return
 
-      const queuePrompt = prompt.value.trim()
+      const queuePrompts = parseLayerPrompts(prompt.value)
+      const queuePrompt = queuePrompts.join(' | ')
       const queueCropId = cropId.value.trim()
       const queueMode = runMode.value
       const queueSettings = normalizeSegmentationSettings(segmentationSettings.value)
-      if (queueMode === 'prompt' && !queuePrompt) {
-        error.value = 'Enter a segmentation prompt before starting the queue.'
+      if (queueMode === 'prompt' && !queuePrompts.length) {
+        error.value = 'Enter at least one layer prompt before starting the queue.'
         return
       }
       if (queueMode === 'aether' && !queueCropId) {
@@ -1120,7 +1281,7 @@ export default {
         while (true) {
           const nextJob = queue.value.find((job) => job.status === 'queued' && !job.serverJobId)
           if (!nextJob) break
-          await processJob(nextJob, queuePrompt, queueMode, queueCropId, queueSettings)
+          await processJob(nextJob, queuePrompt, queueMode, queueCropId, queueSettings, queuePrompts)
         }
       } finally {
         isQueueRunning.value = false
@@ -1128,14 +1289,16 @@ export default {
       }
     }
 
-    const processJob = async (job, queuePrompt, queueMode, queueCropId, queueSettings) => {
+    const processJob = async (job, queuePrompt, queueMode, queueCropId, queueSettings, queuePrompts = []) => {
       currentJobId.value = job.id
       selectedJobId.value = job.id
       Object.assign(job, {
         prompt: queueMode === 'aether' ? '12-class AETHER inference' : queuePrompt,
+        prompts: queueMode === 'aether' ? [] : queuePrompts,
         cropId: queueMode === 'aether' ? queueCropId : '',
         jobType: queueMode,
         settings: queueMode === 'prompt' ? { ...queueSettings } : null,
+        adjustedResult: null,
         status: 'uploading',
         progress: 1,
         uploadProgress: 0,
@@ -1156,6 +1319,9 @@ export default {
           formData.append('crop_id', queueCropId)
         } else {
           formData.append('prompt', queuePrompt)
+          if (queuePrompts.length > 1) {
+            formData.append('prompts_json', JSON.stringify(queuePrompts))
+          }
           appendSegmentationSettings(formData, queueSettings)
         }
 
@@ -1243,6 +1409,7 @@ export default {
       job.message = serverJob.message || job.message
       job.result = serverJob.result || job.result
       job.error = serverJob.error || job.error
+      job.prompts = serverJob.prompts || job.prompts || []
       job.resourceLog = serverJob.resource_log || job.resourceLog || []
       job.resourceLogTotal = Number(serverJob.resource_log_total ?? job.resourceLog.length)
       job.resourceSnapshot = serverJob.resource_snapshot || job.resourceSnapshot || null
@@ -1259,6 +1426,7 @@ export default {
           job.selectedTargetNumbers = targetOutputs(job).map((target, index) => targetNumber(target, index))
         }
         loadOutputHistory()
+        schedulePostprocess(job)
         if (selectedJobId.value === job.id) {
           selectedView.value = targetOutputs(job).length ? 'targets' : 'overlay'
         }
@@ -1272,6 +1440,9 @@ export default {
         cropId.value = job.cropId || ''
       } else {
         prompt.value = job.prompt || ''
+        if (job.prompts?.length) {
+          prompt.value = job.prompts.join('\n')
+        }
         if (job.settings) {
           segmentationSettings.value = normalizeSegmentationSettings(job.settings)
         }
@@ -1287,6 +1458,7 @@ export default {
         resourceLogTotal: 0,
         resourceSnapshot: null,
         selectedTargetNumbers: [],
+        adjustedResult: null,
         result: null,
         error: null,
         startedAt: null,
@@ -1312,6 +1484,7 @@ export default {
             resourceLogTotal: 0,
             resourceSnapshot: null,
             selectedTargetNumbers: [],
+            adjustedResult: null,
             result: null,
             error: null,
             startedAt: null,
@@ -1352,6 +1525,95 @@ export default {
       }
     }
 
+    const segmentationSettingsToApiOptions = (settings) => {
+      const normalized = normalizeSegmentationSettings(settings)
+      return {
+        sam_mask_threshold: normalized.samMaskThreshold,
+        sam_multimask_output: normalized.samMultimaskOutput,
+        mask_min_area: normalized.maskMinArea,
+        mask_cleanup_px: normalized.maskCleanupPx,
+        mask_expand_px: normalized.maskExpandPx,
+        refinement_passes: normalized.refinementPasses,
+        refinement_mode: normalized.refinementMode
+      }
+    }
+
+    const schedulePostprocess = (job = selectedJob.value) => {
+      if (postprocessTimer) {
+        window.clearTimeout(postprocessTimer)
+      }
+      if (!job?.result?.output_id || job.status !== 'succeeded') return
+      postprocessTimer = window.setTimeout(() => {
+        postprocessJob(job)
+      }, 450)
+    }
+
+    const postprocessJob = async (job) => {
+      if (!job?.result?.output_id) return
+      try {
+        const response = await axios.post(`/api/outputs/${job.result.output_id}/postprocess`, {
+          options: segmentationSettingsToApiOptions(segmentationSettings.value),
+          selected_target_numbers: job.selectedTargetNumbers || null
+        })
+        job.adjustedResult = response.data
+      } catch (err) {
+        error.value = `${job.name}: live post-process failed: ${getErrorMessage(err)}`
+      }
+    }
+
+    const refineSavedOutput = async (job) => {
+      if (!job?.result?.output_id || isQueueRunning.value) return
+      try {
+        const prompts = job.prompts?.length
+          ? job.prompts
+          : parseLayerPrompts(job.prompt || prompt.value)
+        const response = await axios.post(`/api/outputs/${job.result.output_id}/refine/jobs`, {
+          prompts,
+          options: segmentationSettingsToApiOptions(segmentationSettings.value)
+        })
+        const refineJob = {
+          id: `refine-${response.data.id}`,
+          serverJobId: response.data.id,
+          file: null,
+          name: `Refine ${job.name}`,
+          size: 0,
+          previewUrl: selectedViewImage(job),
+          previewAvailable: Boolean(selectedViewImage(job)),
+          dimensions: job.dimensions,
+          prompt: response.data.prompt || prompts.join(' | '),
+          prompts,
+          cropId: '',
+          jobType: 'prompt',
+          status: response.data.status || 'queued',
+          progress: Number(response.data.progress || 0),
+          uploadProgress: 100,
+          stage: response.data.stage || 'Queued',
+          message: response.data.message || 'Waiting to refine saved output',
+          elapsedMs: 0,
+          startedAt: Date.now(),
+          completedAt: null,
+          resourceLog: response.data.resource_log || [],
+          resourceLogTotal: Number(response.data.resource_log_total || 0),
+          resourceSnapshot: response.data.resource_snapshot || null,
+          settings: normalizeSegmentationSettings(segmentationSettings.value),
+          selectedTargetNumbers: [],
+          adjustedResult: null,
+          result: null,
+          error: null
+        }
+        queue.value.unshift(refineJob)
+        selectedJobId.value = refineJob.id
+        currentJobId.value = refineJob.id
+        isQueueRunning.value = true
+        await pollServerJob(refineJob)
+      } catch (err) {
+        error.value = `${job.name}: refinement failed: ${getErrorMessage(err)}`
+      } finally {
+        isQueueRunning.value = false
+        currentJobId.value = null
+      }
+    }
+
     const downloadJob = (job) => {
       const imageSource = selectedViewImage(job)
       if (!imageSource) return
@@ -1364,9 +1626,11 @@ export default {
     const resultViewAvailable = (job, viewId) => {
       if (!job) return false
       if (viewId === 'before') return Boolean(job.previewAvailable)
-      if (viewId === 'overlay') return Boolean(job.result?.visualization_base64 || job.result?.visualization_url)
-      if (viewId === 'mask') return Boolean(job.result?.mask_base64 || job.result?.mask_url)
-      if (viewId === 'segmented') return Boolean(job.result?.segmented_image_base64 || job.result?.segmented_image_url)
+      const result = displayResult(job)
+      if (viewId === 'overlay') return Boolean(result?.visualization_base64 || result?.visualization_url)
+      if (viewId === 'mask') return Boolean(result?.mask_base64 || result?.mask_url)
+      if (viewId === 'segmented') return Boolean(result?.segmented_image_base64 || result?.segmented_image_url)
+      if (viewId === 'layers') return layerOutputs(job).length > 0
       if (viewId === 'targets') return targetOutputs(job).length > 0
       if (viewId === 'passes') return passOutputs(job).length > 0
       return false
@@ -1375,6 +1639,28 @@ export default {
     const imageSource = (base64Value, urlValue) => {
       if (base64Value) return `data:image/png;base64,${base64Value}`
       return urlValue || ''
+    }
+
+    const displayResult = (job) => {
+      return job?.adjustedResult || job?.result || {}
+    }
+
+    const layerOutputs = (job) => {
+      return Array.isArray(job?.result?.layers) ? job.result.layers : []
+    }
+
+    const selectedLayerOutput = (job) => {
+      const outputs = layerOutputs(job)
+      if (!outputs.length) return null
+      const clampedIndex = Math.min(Math.max(selectedLayerIndex.value, 0), outputs.length - 1)
+      if (clampedIndex !== selectedLayerIndex.value) {
+        selectedLayerIndex.value = clampedIndex
+      }
+      return outputs[clampedIndex]
+    }
+
+    const layerSegmentedImage = (layerOutput) => {
+      return imageSource(layerOutput?.segmented_image_base64, layerOutput?.segmented_image_url)
     }
 
     const targetOutputs = (job) => {
@@ -1418,6 +1704,7 @@ export default {
         current.add(number)
       }
       job.selectedTargetNumbers = Array.from(current).sort((a, b) => a - b)
+      schedulePostprocess(job)
     }
 
     const passOutputs = (job) => {
@@ -1443,14 +1730,20 @@ export default {
       if (selectedView.value === 'before' && job.previewAvailable) {
         return job.previewUrl
       }
+      const result = displayResult(job)
       if (selectedView.value === 'overlay') {
-        return imageSource(job.result?.visualization_base64, job.result?.visualization_url)
+        return imageSource(result?.visualization_base64, result?.visualization_url)
       }
       if (selectedView.value === 'mask') {
-        return imageSource(job.result?.mask_base64, job.result?.mask_url)
+        return imageSource(result?.mask_base64, result?.mask_url)
       }
       if (selectedView.value === 'segmented') {
-        return imageSource(job.result?.segmented_image_base64, job.result?.segmented_image_url)
+        return imageSource(result?.segmented_image_base64, result?.segmented_image_url)
+      }
+      if (selectedView.value === 'layers') {
+        const layerOutput = selectedLayerOutput(job)
+        const layerImage = layerSegmentedImage(layerOutput)
+        if (layerImage) return layerImage
       }
       if (selectedView.value === 'targets') {
         const targetOutput = selectedTargetOutput(job)
@@ -1538,6 +1831,17 @@ export default {
         values: ramValues,
         latestLabel: formatResourcePercent(samples.at(-1)?.ram?.used, samples.at(-1)?.ram?.total)
       })
+      const cpuValues = samples.map((snapshot) => {
+        const value = snapshot.cpu?.usage_percent
+        return value === null || value === undefined ? null : Math.max(0, Math.min(100, Number(value)))
+      })
+      series.push({
+        id: 'cpu',
+        label: 'CPU',
+        color: '#f97316',
+        values: cpuValues,
+        latestLabel: `${Math.round(cpuValues.at(-1) ?? 0)}%`
+      })
 
       const maxGpuCount = Math.max(0, ...samples.map((snapshot) => (snapshot.gpus || []).length))
       const gpuColors = ['#a78bfa', '#34d399', '#fbbf24', '#fb7185']
@@ -1554,6 +1858,17 @@ export default {
           color: gpuColors[index % gpuColors.length],
           values,
           latestLabel: formatResourcePercent(latestGpu?.used, latestGpu?.total)
+        })
+        const utilizationValues = samples.map((snapshot) => {
+          const value = (snapshot.gpus || [])[index]?.utilization_percent
+          return value === null || value === undefined ? null : Math.max(0, Math.min(100, Number(value)))
+        })
+        series.push({
+          id: `gpu-${index}-util`,
+          label: `GPU ${index} Compute`,
+          color: gpuColors[(index + 1) % gpuColors.length],
+          values: utilizationValues,
+          latestLabel: `${Math.round(utilizationValues.at(-1) ?? 0)}%`
         })
       }
 
@@ -1703,6 +2018,7 @@ export default {
 
     onMounted(() => {
       checkModelStatus()
+      loadRuntimeSettings()
       loadOutputHistory()
       elapsedTimer = window.setInterval(() => {
         const now = Date.now()
@@ -1714,9 +2030,16 @@ export default {
       }, 1000)
     })
 
+    watch(segmentationSettings, () => {
+      schedulePostprocess(selectedJob.value)
+    }, { deep: true })
+
     onUnmounted(() => {
       if (elapsedTimer) {
         window.clearInterval(elapsedTimer)
+      }
+      if (postprocessTimer) {
+        window.clearTimeout(postprocessTimer)
       }
       queue.value.forEach((job) => URL.revokeObjectURL(job.previewUrl))
     })
@@ -1730,6 +2053,7 @@ export default {
       selectedJobId,
       selectedView,
       selectedPassIndex,
+      selectedLayerIndex,
       selectedViewAlt,
       selectedJob,
       currentJob,
@@ -1743,6 +2067,7 @@ export default {
       outputHistory,
       historyLoading,
       segmentationSettings,
+      runtimeSettings,
       selectedTargetIndex,
       refinementModeDescription,
       suggestedPrompts,
@@ -1758,13 +2083,18 @@ export default {
       startQueue,
       loadOutputHistory,
       openSavedOutput,
+      appendPromptLayer,
+      applyRuntimeSettings,
       resetSegmentationSettings,
       retryJob,
       retryFailed,
       removeJob,
       clearFinished,
+      refineSavedOutput,
       downloadJob,
       resultViewAvailable,
+      layerOutputs,
+      layerSegmentedImage,
       targetOutputs,
       targetSegmentedImage,
       targetSelected,
